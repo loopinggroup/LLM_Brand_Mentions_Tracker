@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(pip3 show *)",
+      "Bash(pip3 install *)",
+      "WebFetch(domain:docs.langdock.com)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\)\")",
+      "Bash(timeout 8 streamlit run app.py --server.headless true --server.port 8765)",
+      "Bash(python3 -m py_compile app.py)",
+      "WebSearch",
+      "WebFetch(domain:ai-sdk.dev)",
+      "Bash(python3 -m py_compile /Users/bes/Documents/LLM_pipeline/LLM_Brand_Mentions_Tracker/app.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m pyflakes app.py)",
+      "Bash(python3 -m pyflakes --version)",
+      "Bash(pip show *)",
+      "Bash(python3 -)"
+    ]
+  }
+}
