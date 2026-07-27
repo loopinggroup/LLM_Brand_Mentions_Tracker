@@ -17,7 +17,9 @@
       "Bash(python3 -m pyflakes app.py)",
       "Bash(python3 -m pyflakes --version)",
       "Bash(pip show *)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(python -m py_compile app.py)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

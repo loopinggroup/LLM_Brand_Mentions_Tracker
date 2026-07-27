@@ -62,6 +62,8 @@ def init_state():
         "raw_answers":    [],   # phase 1 output — Q&A only, no brand analysis
         "phase1_errors":  [],   # failed calls collected during phase 1
         "results":        [],   # phase 2 output — with brands + sentiment
+        "unlisted_brands": [],  # manual mode: brands the model found that aren't on the user's list
+        "analysis_summary": "",  # phase 2 executive summary (from the single Opus call)
         "stop_requested": False,
         "timing":         {},   # phase wall times + per-call elapsed data
         "lang":           "de", # UI + model response language: "de" or "en"
@@ -74,7 +76,7 @@ init_state()
 
 def reset_process():
     """Clears everything but the language preference and restarts at Step 1."""
-    for key in ["step", "config", "questions", "raw_answers", "phase1_errors", "results", "timing"]:
+    for key in ["step", "config", "questions", "raw_answers", "phase1_errors", "results", "unlisted_brands", "analysis_summary", "timing"]:
         if key in st.session_state:
             del st.session_state[key]
     init_state()
@@ -132,8 +134,30 @@ QUESTION_MAX_TOKENS = 16000 # question generation: reasoning model uses token bu
 # which model collected the answers — so the brand/sentiment judgement is consistent
 # across runs and doesn't inherit weaker models' extraction errors.
 ANALYSIS_MODEL              = "claude-opus-4-8"
-DATASET_ANALYSIS_MAX_TOKENS = 16000  # single whole-dataset analysis call returns a large flat JSON array
+DATASET_ANALYSIS_MAX_TOKENS = 16000  # per-batch analysis output cap; batching keeps the array from being truncated
 ANALYSIS_ANSWER_CHARS       = 2000   # per-answer truncation in the analysis prompt — bounds total input tokens
+
+# Sampling temperature.
+# Collection uses a non-zero temperature so that repeating the SAME question N times
+# actually produces varied answers — otherwise "runs per question" adds no statistical
+# information (a deterministic model returns the identical answer N times). Question
+# generation runs a bit hotter for diversity. Analysis runs at 0 so brand/sentiment
+# judgements are as reproducible as possible across re-analysis.
+COLLECTION_TEMPERATURE = 0.7
+QUESTION_TEMPERATURE   = 0.8
+ANALYSIS_TEMPERATURE   = 0.0
+
+# The whole-dataset analysis is split into batches. A single call capped at
+# DATASET_ANALYSIS_MAX_TOKENS silently truncates its JSON array on large runs
+# (finish_reason=max_tokens → unparseable → total loss of ALL analysis). Batching
+# bounds each call's output and makes one bad batch cost only that batch. A batch is
+# limited by answer count AND estimated input tokens, whichever is hit first.
+ANALYSIS_BATCH_MAX_ANSWERS      = 40
+ANALYSIS_BATCH_MAX_INPUT_TOKENS = 40000
+
+# Long answers are truncated head+tail (not head-only) before analysis, so brands
+# listed near the END of an answer — items 8–15 of a "top tools" list — aren't dropped.
+ANALYSIS_ANSWER_HEAD_FRAC = 0.7
 
 # ---------------------------------------------------------------------------
 # Available models grouped by provider
@@ -217,6 +241,7 @@ def call_langdock(
     max_tokens: int = MAX_TOKENS,
     web_search: bool = False,
     lang: str = "de",
+    temperature: float | None = None,
 ) -> tuple[str | None, str | None, dict]:
     """
     Returns (response_text, error_message, usage).
@@ -226,6 +251,11 @@ def call_langdock(
     `lang` must be passed explicitly (not read from st.session_state) because this
     function runs inside ThreadPoolExecutor worker threads, where Streamlit's
     session_state is not accessible.
+
+    `temperature` is forwarded to the provider-native endpoints when set. It is NOT
+    applied on the web-search (Agent API) path — that endpoint's request shape doesn't
+    document a temperature field, and answer variability there already comes from live
+    search results rather than sampling, so run-to-run runs still differ.
     """
     if web_search:
         # Real web search is only available via the model-agnostic Agent Completions
@@ -252,6 +282,8 @@ def call_langdock(
             "messages":   messages,
             "max_tokens": max_tokens,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
     elif google:
         payload = {
             "contents": [
@@ -265,12 +297,16 @@ def call_langdock(
                 "maxOutputTokens": max_tokens,
             },
         }
+        if temperature is not None:
+            payload["generationConfig"]["temperature"] = temperature
     else:
         payload = {
             "model":                 model,
             "messages":              messages,
             "max_completion_tokens": max_tokens,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
     for attempt in range(4):
         try:
             t0 = time.time()
@@ -448,11 +484,12 @@ def call_langdock_agent(
             # "I don't have real-time access" response instead of trying the tool,
             # particularly for questions they're confident are "in the future".
             "instructions": (
-                "You have access to a real-time web search tool. Always use it for questions "
-                "involving current events, recent results, prices, rankings, releases, or anything "
-                "that may have changed after your training cutoff — search first, don't assume "
-                "something hasn't happened yet just because it seems recent. Never answer such "
-                "questions from memory alone."
+                "You have a live web search tool with current results. For any question about "
+                "products, brands, providers, rankings, prices, or recommendations, search the web "
+                "first and base your answer on what you find — even if you feel you already know the "
+                "answer, since your training data is outdated. Do not state or imply you lack "
+                "real-time access; you have it. Only skip searching for purely timeless facts "
+                "(definitions, basic concepts)."
             ),
             "model":        model,
             "capabilities": {"webSearch": True},
@@ -552,10 +589,15 @@ def call_langdock_agent(
                         web_search = True
                         _harvest_urls(event)
 
-                # Anthropic models embed inline 【toolu_…】 citation markers in the answer
-                # text itself. Their presence is proof a tool ran even when the stream's
-                # tool/source events use a shape we didn't catch above. Strip them so the
-                # stored/displayed/analyzed answer is clean.
+                # Any harvested source URL is itself proof a search ran — regardless of
+                # which event carried it or whether the tool name contained "search".
+                if sources:
+                    web_search = True
+
+                # Models embed inline citation markers (【toolu_…】 / 【call_…】) in the
+                # answer text itself. Their presence is proof a tool ran even when the
+                # stream's tool/source events use a shape we didn't catch above. Strip
+                # them so the stored/displayed/analyzed answer is clean.
                 full_text, n_citations = _strip_citation_markers(full_text)
                 if n_citations:
                     web_search = True
@@ -649,6 +691,27 @@ def test_connection(api_key: str, model: str, web_search: bool = False) -> tuple
 # Sends the topic and asks the model to generate N questions.
 # Returns a list of question strings, one per line.
 # ---------------------------------------------------------------------------
+# Strips list scaffolding models add despite being told not to: "1. ", "1) ",
+# "- ", "* ", "• ", and surrounding quotes.
+_Q_PREFIX_RE = re.compile(r'^\s*(?:\d+[.)]\s*|[-*•]\s*)+')
+
+def _clean_question_line(line: str) -> str:
+    q = _Q_PREFIX_RE.sub("", line).strip()
+    if len(q) >= 2 and q[0] in "\"'“„" and q[-1] in "\"'”“":
+        q = q[1:-1].strip()
+    return q
+
+def _dedupe_questions(questions: list[str]) -> list[str]:
+    """Case-insensitive, whitespace-normalized dedupe that preserves first-seen order."""
+    out, seen = [], set()
+    for q in questions:
+        key = re.sub(r"\s+", " ", q).strip().lower().rstrip("?.!")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(q)
+    return out
+
 def generate_questions(api_key: str, topic: str, n: int, model: str) -> tuple[list[str], str | None]:
     lang = st.session_state.get("lang", "de")
     if lang == "de":
@@ -657,9 +720,10 @@ def generate_questions(api_key: str, topic: str, n: int, model: str) -> tuple[li
             "Die Fragen sollen:\n"
             "- Typische Nutzerfragen sein, die jemand einem KI-Assistenten stellen würde\n"
             "- Verschiedene Aspekte des Themas abdecken (Empfehlungen, Vergleiche, Eigenschaften, Use Cases)\n"
+            "- Sich inhaltlich klar voneinander unterscheiden (keine Umformulierungen derselben Frage)\n"
             "- So formuliert sein, dass die Antwort natürlicherweise Marken, Produkte oder Anbieter nennen würde\n\n"
-            "Antworte NUR mit den Fragen, eine pro Zeile, ohne Nummerierung, ohne Einleitung. "
-            "Antworte auf Deutsch."
+            "Antworte NUR mit einem validen JSON-Array von Strings (ohne Markdown, ohne Einleitung), "
+            f'z.B. ["Frage 1?", "Frage 2?"]. Genau {n} Elemente. Fragen auf Deutsch.'
         )
     else:
         prompt = (
@@ -667,9 +731,10 @@ def generate_questions(api_key: str, topic: str, n: int, model: str) -> tuple[li
             "The questions should:\n"
             "- Be typical user questions someone would ask an AI assistant\n"
             "- Cover different aspects of the topic (recommendations, comparisons, features, use cases)\n"
+            "- Be clearly distinct from one another (no rephrasings of the same question)\n"
             "- Be phrased so that the answer would naturally mention brands, products, or providers\n\n"
-            "Respond ONLY with the questions, one per line, no numbering, no introduction. "
-            "Respond in English."
+            "Respond ONLY with a valid JSON array of strings (no markdown, no introduction), "
+            f'e.g. ["Question 1?", "Question 2?"]. Exactly {n} elements. Questions in English.'
         )
     text, err, _ = call_langdock(
         api_key,
@@ -677,10 +742,35 @@ def generate_questions(api_key: str, topic: str, n: int, model: str) -> tuple[li
         model=model,
         max_tokens=QUESTION_MAX_TOKENS,  # reasoning models consume the budget for internal thinking + output
         lang=lang,
+        temperature=QUESTION_TEMPERATURE,
     )
     if not text:
         return [], err
-    questions = [q.strip() for q in text.strip().splitlines() if q.strip()]
+
+    # Prefer the requested JSON array; fall back to line-splitting if the model
+    # ignored the format. Either way, strip list scaffolding and dedupe.
+    parsed = _parse_json_array(text)
+    if parsed:
+        raw = [str(q) for q in parsed if isinstance(q, (str, int, float))]
+    else:
+        raw = text.strip().splitlines()
+
+    questions = _dedupe_questions(
+        [q for q in (_clean_question_line(line) for line in raw) if q]
+    )
+
+    if not questions:
+        return [], tr(
+            "Es konnten keine Fragen aus der Antwort extrahiert werden.",
+            "No questions could be extracted from the response.",
+            lang=lang,
+        )
+    if len(questions) > n:
+        questions = questions[:n]  # model over-generated; trim to the requested count
+    if len(questions) < n:
+        # Fewer than requested after dedupe — usually near-duplicates were collapsed.
+        # Not an error: Step 2 shows the real count and lets the user add more.
+        log.info("generate_questions: requested %d, got %d after cleaning/dedupe", n, len(questions))
     return questions, None
 
 
@@ -736,6 +826,9 @@ def ask_question(
         max_tokens=max_tokens,
         web_search=web_search,
         lang=lang,
+        # Non-zero so repeated runs of the same question vary — otherwise the
+        # multiple-runs statistic is meaningless. No effect on the web-search path.
+        temperature=COLLECTION_TEMPERATURE,
     )
 
 
@@ -750,14 +843,17 @@ def _strip_html(text: str, max_len: int = 200) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Web-search citation markers. When the Agent API's web search runs, Anthropic
-# models embed inline citation references like 【toolu_vrtx_014m5maSG2ZTGFn9...-5】
-# directly in the answer text. These pollute the displayed answer AND the brand
-# analysis input, so we strip them — but their presence is also hard proof that
-# a tool (search) actually ran, so we report whether any were found.
-# Matches both full-width 【…】 and ASCII […] brackets containing a `toolu_` id.
+# Web-search citation markers. When the Agent API's web search runs, models embed
+# inline citation references into the answer text pointing at the tool-call that
+# produced each fact. The prefix differs by provider:
+#   Anthropic → 【toolu_vrtx_014m5maSG2ZTGFn9...-5】
+#   OpenAI    → 【call_ft31fjFd1YmhnAeYTDMVo6uI-2】
+# These pollute the displayed answer AND the brand-analysis input, so we strip
+# them — but their presence is also hard proof a tool (search) actually ran, so
+# we report how many were found. Matches full-width 【…】 and ASCII […] brackets
+# around a `<prefix>_<id>` token for any known tool-call id prefix.
 # ---------------------------------------------------------------------------
-_CITATION_RE = re.compile(r"[【\[]\s*toolu_[A-Za-z0-9_\-]+\s*[】\]]")
+_CITATION_RE = re.compile(r"[【\[]\s*(?:toolu|call|fc|tool|resp|ws)_[A-Za-z0-9_\-]+\s*[】\]]")
 
 def _strip_citation_markers(text: str) -> tuple[str, int]:
     """Returns (cleaned_text, marker_count)."""
@@ -823,36 +919,98 @@ def _parse_json_array(text: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Whole-dataset brand analysis — one prompt, one strong model (ANALYSIS_MODEL).
-# Instead of one extraction call per answer/chunk, the entire collected dataset
-# is sent to a single Claude Opus 4.8 call. Each answer is numbered; the model
-# returns a flat JSON array where every element ties one brand mention back to
-# its answer via "index", which we then regroup per answer.
+# Robust JSON-object extractor — same three strategies as _parse_json_array but
+# for a top-level {...}. Returns {} on total failure.
+# ---------------------------------------------------------------------------
+def _parse_json_object(text: str) -> dict:
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+    fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+    if fence:
+        try:
+            return json.loads(fence.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    try:
+                        result = json.loads(candidate)
+                        if isinstance(result, dict):
+                            return result
+                    except json.JSONDecodeError:
+                        pass
+                    break
+        start = text.find("{", start + 1)
+
+    log.warning("Analysis JSON object parse failed. Response: %s", text[:300])
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Whole-dataset brand analysis. The collected dataset is split into batches
+# (see _make_analysis_batches) and each batch is sent to a single strong model
+# (ANALYSIS_MODEL). Batching keeps a large run's output JSON from being silently
+# truncated — a single mega-call that hits finish_reason=max_tokens produces
+# unparseable JSON and loses ALL analysis, whereas a bad batch loses only itself.
+# Each answer in a batch is numbered locally; the model returns a flat array whose
+# "index" ties each brand mention back to its answer, which we regroup (offsetting
+# the local index by the batch's start position) per answer.
 #
 # Works in both modes:
 #   brands=[]    → auto: model identifies all brands
-#   brands=[...] → manual: model checks only those brands
+#   brands=[...] → manual: model still detects all brands (so unlisted competitors
+#                  can be surfaced), using the given names as canonical spellings;
+#                  the client filters to the listed brands (see _run_brand_analysis).
 # ---------------------------------------------------------------------------
-def analyze_dataset(
-    api_key: str,
-    answers: list[dict],
-    brands: list[str],
-    lang: str,
-) -> tuple[dict[int, list[dict]], dict, str | None]:
+def _truncate_for_analysis(text: str) -> str:
+    """Head+tail truncation so brands listed near the END of a long answer survive."""
+    text = text or ""
+    if len(text) <= ANALYSIS_ANSWER_CHARS:
+        return text
+    head_len = int(ANALYSIS_ANSWER_CHARS * ANALYSIS_ANSWER_HEAD_FRAC)
+    tail_len = ANALYSIS_ANSWER_CHARS - head_len
+    return text[:head_len].rstrip() + " […] " + text[-tail_len:].lstrip()
+
+
+def _make_analysis_batches(answers: list[dict]) -> list[tuple[int, list[dict]]]:
     """
-    Returns (by_index, usage, error).
-      by_index: {answer_index: [ {brand, sentiment, confidence, reason, aspect, excerpt}, ... ]}
-      usage:    token usage dict from the single analysis call
-      error:    human-readable error string, or None on success
-    `answers` is a list of dicts each with "question" and "answer"; the list index
-    is the stable key used in the prompt and in the returned mapping.
+    Splits answers into (start_index, sublist) batches bounded by both an answer
+    count and an estimated input-token budget, whichever is reached first.
     """
-    # Build the numbered corpus. Truncate each answer so a large run doesn't blow
-    # past the model's input budget — brand mentions and their immediate context
-    # almost always sit well within the first ANALYSIS_ANSWER_CHARS characters.
+    batches: list[tuple[int, list[dict]]] = []
+    i, n = 0, len(answers)
+    while i < n:
+        j, tok = i, 0
+        while j < n and (j - i) < ANALYSIS_BATCH_MAX_ANSWERS:
+            ans_chars = min(len(answers[j].get("answer") or ""), ANALYSIS_ANSWER_CHARS)
+            tok += ans_chars // 4 + len(answers[j].get("question") or "") // 4 + 40
+            if tok > ANALYSIS_BATCH_MAX_INPUT_TOKENS and j > i:
+                break
+            j += 1
+        batches.append((i, answers[i:j]))
+        i = j
+    return batches
+
+
+def _build_analysis_prompt(batch: list[dict], brands: list[str], lang: str) -> str:
+    """Builds the analysis prompt for one batch; answers are numbered [0..len-1] locally."""
     blocks = []
-    for i, a in enumerate(answers):
-        ans = (a.get("answer") or "")[:ANALYSIS_ANSWER_CHARS]
+    for i, a in enumerate(batch):
+        ans = _truncate_for_analysis(a.get("answer") or "")
         blocks.append(f"[{i}] Frage: {a['question']}\nAntwort: {ans}")
     corpus = "\n\n".join(blocks)
 
@@ -860,9 +1018,10 @@ def analyze_dataset(
         if brands:
             brand_list = ", ".join(f'"{b}"' for b in brands)
             scope = (
-                f"Berücksichtige AUSSCHLIESSLICH diese Marken: {brand_list}. "
-                "Ignoriere alle anderen Marken, Produkte oder Anbieter. "
-                'Verwende den Markennamen exakt wie in der Liste angegeben.'
+                "Erkenne alle genannten Marken, Produkte und Anbieter. "
+                f"Besonders wichtig sind diese Marken: {brand_list}. "
+                "Verwende für sie exakt die angegebene Schreibweise. "
+                "Nenne aber auch alle anderen tatsächlich erwähnten Marken."
             )
         else:
             scope = (
@@ -874,16 +1033,21 @@ def analyze_dataset(
             "Du bist ein Analyst für Markensichtbarkeit in LLM-Antworten. "
             "Unten stehen nummerierte Antworten eines Sprachmodells auf verschiedene Fragen.\n\n"
             f"{scope}\n\n"
-            "Gib für JEDE Antwort und JEDE darin tatsächlich erwähnte Marke ein JSON-Objekt zurück mit:\n"
-            '- "index": die Nummer der Antwort in eckigen Klammern (Ganzzahl)\n'
-            '- "brand": Markenname (normalisiert)\n'
-            '- "sentiment": "positive", "neutral" oder "negative"\n'
-            '- "confidence": "high", "medium" oder "low"\n'
-            '- "reason": Ein Satz auf Deutsch, der das Sentiment begründet\n'
-            '- "aspect": Hauptaspekt, z.B. "Qualität", "Preis", "Empfehlung", "Bekanntheit", "Funktionen"\n'
-            '- "excerpt": Relevanter Satz aus der Antwort (max 200 Zeichen)\n\n'
-            "Wird eine Marke innerhalb derselben Antwort mehrfach genannt, gib sie für diese Antwort nur EINMAL aus. "
-            "Antworte NUR mit einem validen JSON-Array, ohne Markdown. Wenn nichts erkannt wird: []\n\n"
+            "Antworte NUR mit einem validen JSON-Objekt (ohne Markdown) mit genau zwei Feldern:\n\n"
+            '"mentions": Ein Array. Für JEDE Antwort und JEDE darin tatsächlich erwähnte Marke ein Objekt mit:\n'
+            '  - "index": die Nummer der Antwort in eckigen Klammern (Ganzzahl)\n'
+            '  - "brand": Markenname (normalisiert)\n'
+            '  - "sentiment": "positive", "neutral" oder "negative"\n'
+            '  - "confidence": "high", "medium" oder "low"\n'
+            '  - "reason": Ein Satz auf Deutsch, der das Sentiment begründet\n'
+            '  - "aspect": Hauptaspekt, z.B. "Qualität", "Preis", "Empfehlung", "Bekanntheit", "Funktionen"\n'
+            '  - "excerpt": Relevanter Satz aus der Antwort (max 200 Zeichen)\n'
+            '  - "rank": Position dieser Marke in der Antwort (1 = zuerst genannte Marke), Ganzzahl\n'
+            "  Wird eine Marke innerhalb derselben Antwort mehrfach genannt, gib sie für diese Antwort nur EINMAL aus.\n\n"
+            '"summary": Eine kurze, sachliche Zusammenfassung auf Deutsch (3–5 Sätze) über den gesamten Datensatz: '
+            "welche Marken dominieren (Sichtbarkeit/Nennungen), welche auffällig selten oder gar nicht vorkommen, "
+            "und die vorherrschende Tonalität. Keine Aufzählung, Fließtext.\n\n"
+            "Wenn keine Marken erkannt werden: {\"mentions\": [], \"summary\": \"...\"}\n\n"
             "=== ANTWORTEN ===\n"
             f"{corpus}"
         )
@@ -891,9 +1055,10 @@ def analyze_dataset(
         if brands:
             brand_list = ", ".join(f'"{b}"' for b in brands)
             scope = (
-                f"Consider ONLY these brands: {brand_list}. "
-                "Ignore any other brands, products, or providers. "
-                "Use the brand name exactly as given in the list."
+                "Detect all brands, products, and providers mentioned. "
+                f"These brands are of particular interest: {brand_list}. "
+                "Use exactly the given spelling for them. "
+                "But also report every other brand actually mentioned."
             )
         else:
             scope = (
@@ -905,58 +1070,182 @@ def analyze_dataset(
             "You are an analyst for brand visibility in LLM answers. "
             "Below are numbered answers a language model gave to various questions.\n\n"
             f"{scope}\n\n"
-            "For EACH answer and EACH brand actually mentioned in it, return a JSON object with:\n"
-            '- "index": the answer number shown in square brackets (integer)\n'
-            '- "brand": brand name (normalized)\n'
-            '- "sentiment": "positive", "neutral", or "negative"\n'
-            '- "confidence": "high", "medium", or "low"\n'
-            '- "reason": one sentence in English justifying the sentiment\n'
-            '- "aspect": main aspect, e.g. "quality", "price", "recommendation", "reputation", "features"\n'
-            '- "excerpt": relevant sentence from the answer (max 200 characters)\n\n'
-            "If a brand is mentioned several times within the same answer, output it only ONCE for that answer. "
-            "Respond ONLY with a valid JSON array, no markdown. If nothing is detected: []\n\n"
+            "Respond ONLY with a valid JSON object (no markdown) with exactly two fields:\n\n"
+            '"mentions": An array. For EACH answer and EACH brand actually mentioned in it, an object with:\n'
+            '  - "index": the answer number shown in square brackets (integer)\n'
+            '  - "brand": brand name (normalized)\n'
+            '  - "sentiment": "positive", "neutral", or "negative"\n'
+            '  - "confidence": "high", "medium", or "low"\n'
+            '  - "reason": one sentence in English justifying the sentiment\n'
+            '  - "aspect": main aspect, e.g. "quality", "price", "recommendation", "reputation", "features"\n'
+            '  - "excerpt": relevant sentence from the answer (max 200 characters)\n'
+            '  - "rank": position of this brand within the answer (1 = first brand mentioned), integer\n'
+            "  If a brand is mentioned several times within the same answer, include it only ONCE for that answer.\n\n"
+            '"summary": A short, factual summary in English (3–5 sentences) about the whole dataset: '
+            "which brands dominate (visibility/mentions), which are notably rare or absent, and the prevailing "
+            "sentiment. Prose, not a list.\n\n"
+            "If no brands are detected: {\"mentions\": [], \"summary\": \"...\"}\n\n"
             "=== ANSWERS ===\n"
             f"{corpus}"
         )
+    return prompt
 
+
+_MENTION_FIELDS = ("brand", "sentiment", "confidence", "reason", "aspect", "excerpt", "rank")
+
+
+def _analyze_batch(
+    api_key: str, batch: list[dict], brands: list[str], lang: str,
+) -> tuple[list[dict], str, dict, str | None]:
+    """Runs one batch. Returns (mentions, summary, usage, error). Mentions keep the
+    batch-local "index" as returned by the model — the caller offsets it."""
+    prompt = _build_analysis_prompt(batch, brands, lang)
     text, err, usage = call_langdock(
         api_key,
         [{"role": "user", "content": prompt}],
         model=ANALYSIS_MODEL,
         max_tokens=DATASET_ANALYSIS_MAX_TOKENS,
         lang=lang,
+        temperature=ANALYSIS_TEMPERATURE,
     )
     if not text:
-        log.warning("Dataset analysis failed: %s", err)
-        return {}, usage, err
+        log.warning("Dataset analysis batch failed: %s", err)
+        return [], "", usage, err
 
-    flat = _parse_json_array(text)
-    # Distinguish "genuinely no brands" ([]), from a parse failure / truncated JSON.
-    # A stripped response of "[]" is a real empty result; anything else that parses
-    # to an empty list means the model's output couldn't be read — surface that so
-    # the user isn't shown an empty dashboard as if no brands existed.
+    obj  = _parse_json_object(text)
+    # Backward-compatible fallback: if the model returned a bare array instead of the
+    # {mentions, summary} object, treat the array as the mentions list.
+    flat = obj.get("mentions") if isinstance(obj.get("mentions"), list) else _parse_json_array(text)
+    summary = (obj.get("summary") or "").strip() if isinstance(obj, dict) else ""
+
+    # Distinguish "genuinely no brands" from a parse failure / truncated JSON. A clean
+    # empty result ([] or {}) is legitimate; a non-empty response that parsed to nothing
+    # means the output was unreadable (likely truncated) — surface it.
     parse_err = None
-    if not flat and text.strip() not in ("[]", ""):
+    if not flat and text.strip() not in ("[]", "{}", "") and not summary:
         parse_err = tr(
-            "Analyse-Antwort konnte nicht als JSON gelesen werden (evtl. abgeschnitten). "
-            "Bei großen Datensätzen: weniger Fragen/Runs verwenden.",
-            "Analysis response could not be parsed as JSON (possibly truncated). "
-            "For large datasets, use fewer questions/runs.",
+            "Ein Analyse-Batch konnte nicht als JSON gelesen werden (evtl. abgeschnitten).",
+            "An analysis batch could not be parsed as JSON (possibly truncated).",
             lang=lang,
         )
-        log.warning("Dataset analysis: non-empty response but empty parse. First 300 chars: %s", text[:300])
+        log.warning("Analysis batch: non-empty response but empty parse. First 300 chars: %s", text[:300])
 
+    return (flat or []), summary, usage, parse_err
+
+
+def _summarize_dataset(
+    api_key: str, by_index: dict[int, list[dict]], n_answers: int, lang: str,
+) -> tuple[str, dict, str | None]:
+    """Produces one executive summary from aggregated stats. Used only when the dataset
+    spans multiple batches (each batch's own summary would see only part of the data)."""
+    from collections import Counter
+    coverage, sentiment = Counter(), Counter()
+    for entries in by_index.values():
+        for e in entries:
+            b = (e.get("brand") or "").strip()
+            if not b:
+                continue
+            coverage[b] += 1
+            sentiment[(e.get("sentiment") or "neutral")] += 1
+    if not coverage:
+        return "", {}, None
+
+    stats = "\n".join(f"{b}: {c}/{n_answers}" for b, c in coverage.most_common(20))
+    sent  = ", ".join(f"{k}: {v}" for k, v in sentiment.items())
+    if lang == "de":
+        prompt = (
+            "Du erhältst aggregierte Statistiken einer Markensichtbarkeits-Analyse über einen ganzen "
+            "Datensatz. Schreibe eine kurze, sachliche Zusammenfassung (3–5 Sätze, Fließtext, keine "
+            "Aufzählung): welche Marken dominieren, welche selten/gar nicht vorkommen, und die "
+            f"vorherrschende Tonalität.\n\nMarken-Abdeckung (Antworten mit Nennung):\n{stats}\n\n"
+            f"Sentiment-Verteilung: {sent}"
+        )
+    else:
+        prompt = (
+            "You are given aggregated statistics from a brand-visibility analysis over a whole dataset. "
+            "Write a short, factual summary (3–5 sentences, prose, not a list): which brands dominate, "
+            "which are rare or absent, and the prevailing sentiment.\n\n"
+            f"Brand coverage (answers mentioning the brand):\n{stats}\n\nSentiment distribution: {sent}"
+        )
+    text, err, usage = call_langdock(
+        api_key,
+        [{"role": "user", "content": prompt}],
+        model=ANALYSIS_MODEL,
+        max_tokens=1000,
+        lang=lang,
+        temperature=ANALYSIS_TEMPERATURE,
+    )
+    return (text or "").strip(), usage, err
+
+
+def analyze_dataset(
+    api_key: str,
+    answers: list[dict],
+    brands: list[str],
+    lang: str,
+) -> tuple[dict[int, list[dict]], str, dict, str | None]:
+    """
+    Returns (by_index, summary, usage, error).
+      by_index: {answer_index: [ {brand, sentiment, confidence, reason, aspect, excerpt, rank}, ... ]}
+      summary:  a short executive-summary paragraph
+      usage:    combined token usage across all analysis calls
+      error:    human-readable error string, or None on success
+    `answers` is a list of dicts each with "question" and "answer"; the list index is
+    the stable key used in the returned mapping.
+    """
+    batches = _make_analysis_batches(answers)
     by_index: dict[int, list[dict]] = {}
-    for item in flat:
-        if not isinstance(item, dict):
-            continue
-        try:
-            idx = int(item.get("index"))
-        except (TypeError, ValueError):
-            continue
-        entry = {k: item.get(k, "") for k in ("brand", "sentiment", "confidence", "reason", "aspect", "excerpt")}
-        by_index.setdefault(idx, []).append(entry)
-    return by_index, usage, parse_err
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    errors: list[str] = []
+    batch_summaries: list[str] = []
+
+    for start, batch in batches:
+        flat, b_summary, usage, err = _analyze_batch(api_key, batch, brands, lang)
+        for k in total_usage:
+            total_usage[k] += usage.get(k, 0)
+        if err:
+            errors.append(err)
+        if b_summary:
+            batch_summaries.append(b_summary)
+        for item in flat:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            # Guard against a hallucinated/out-of-range index — without this the
+            # mention would land under a key the reconstruction loop never reads and
+            # be silently dropped (or misattributed). Validate against THIS batch.
+            if not (0 <= idx < len(batch)):
+                log.warning("Analysis: index %s out of range (batch len=%d, start=%d) — dropped", idx, len(batch), start)
+                continue
+            entry = {k: item.get(k, "") for k in _MENTION_FIELDS}
+            by_index.setdefault(start + idx, []).append(entry)
+
+    # Summary: a single batch already produced one over all its data; multiple batches
+    # each saw only a slice, so synthesize one from the aggregate instead.
+    if len(batches) <= 1:
+        summary = batch_summaries[0] if batch_summaries else ""
+    else:
+        summary, s_usage, _ = _summarize_dataset(api_key, by_index, len(answers), lang)
+        for k in total_usage:
+            total_usage[k] += s_usage.get(k, 0)
+        if not summary and batch_summaries:
+            summary = batch_summaries[0]
+
+    # De-duplicate identical batch errors so the user sees one message, not one per batch.
+    error = None
+    if errors:
+        uniq = list(dict.fromkeys(errors))
+        error = "; ".join(uniq)
+        if any("truncat" in e.lower() or "abgeschnitten" in e.lower() for e in uniq):
+            error += " " + tr(
+                "Betroffene Batches können unvollständig sein.",
+                "Affected batches may be incomplete.",
+                lang=lang,
+            )
+    return by_index, summary, total_usage, error
 
 
 # ---------------------------------------------------------------------------
@@ -978,6 +1267,7 @@ def build_analysis(results: list[dict]) -> pd.DataFrame:
                 "reason":     b.get("reason", ""),
                 "aspect":     b.get("aspect", ""),
                 "excerpt":    b.get("excerpt", b.get("context", "")),
+                "rank":       pd.to_numeric(b.get("rank"), errors="coerce"),
                 "mentions":   1,
             })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -1695,10 +1985,25 @@ def _run_phase1():
     short_answer = cfg.get("short_answer", False)
     lang         = st.session_state.get("lang", "de")  # captured here — worker threads can't read session_state
 
-    total       = len(questions) * runs
-    raw_answers = []
-    errors      = []
+    total        = len(questions) * runs
+    raw_answers  = []
+    errors       = []
+    failed_tasks: list[tuple[int, str, int]] = []  # (question_index, question, run_num) to retry once
     p1_timings: list[dict] = []
+
+    def _record_answer(question: str, run_num: int, answer: str, usage: dict):
+        raw_answers.append({
+            "question":        question,
+            "run":             run_num + 1,
+            "answer":          answer,
+            "model":           model,
+            "tokens_in":       usage.get("prompt_tokens", 0),
+            "tokens_out":      usage.get("completion_tokens", 0),
+            # web-search evidence (only populated when web_search routed via the Agent API)
+            "web_search_used": usage.get("web_search_used", False),
+            "sources":         usage.get("sources", []),
+            "citation_count":  usage.get("citation_count", 0),
+        })
 
     # ------------------------------------------------------------------
     # Phase 1 — Collect answers (parallel)
@@ -1755,25 +2060,18 @@ def _run_phase1():
             _render_live_metrics(metrics_box, completed, total, time.time() - t_phase1, call_times)
 
             if not answer:
-                errors.append(tr(f"Frage {i+1}, Run {run_num+1}: {err}", f"Question {i+1}, Run {run_num+1}: {err}"))
-                error_box.error(tr(
-                    f"⚠️ Frage {i+1}, Run {run_num+1} fehlgeschlagen: {err}",
-                    f"⚠️ Question {i+1}, Run {run_num+1} failed: {err}",
+                # Collect for a single retry pass at the end of the phase rather than
+                # giving up now — an exhausted-retry failure here otherwise leaves this
+                # question with fewer runs than the others, biasing share-of-voice.
+                failed_tasks.append((i, question, run_num))
+                error_box.warning(tr(
+                    f"⚠️ Frage {i+1}, Run {run_num+1} fehlgeschlagen: {err} — wird am Ende erneut versucht.",
+                    f"⚠️ Question {i+1}, Run {run_num+1} failed: {err} — will retry at the end.",
                 ))
                 log.warning("No answer — Frage %d, Run %d: %s", i+1, run_num+1, err)
             else:
                 error_box.empty()
-                raw_answers.append({
-                    "question":        question,
-                    "run":             run_num + 1,
-                    "answer":          answer,
-                    "model":           model,
-                    "tokens_in":       usage.get("prompt_tokens", 0),
-                    "tokens_out":      usage.get("completion_tokens", 0),
-                    # web-search evidence (only populated when web_search routed via the Agent API)
-                    "web_search_used": usage.get("web_search_used", False),
-                    "sources":         usage.get("sources", []),
-                })
+                _record_answer(question, run_num, answer, usage)
                 log.info("Phase1 OK — Frage %d Run %d | len=%d | tok_in=%d tok_out=%d | web_search=%s | sources=%d | %.2fs",
                          i+1, run_num+1, len(answer),
                          usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
@@ -1787,6 +2085,45 @@ def _run_phase1():
 
             if parallel == 1:
                 time.sleep(delay)
+
+    # ------------------------------------------------------------------
+    # Retry pass — one more attempt for calls that failed above. Only runs if the
+    # user didn't stop. Anything still failing after this is recorded as an error.
+    # ------------------------------------------------------------------
+    if failed_tasks and not st.session_state.get("stop_requested", False):
+        status_line.caption(tr(
+            f"Wiederhole {len(failed_tasks)} fehlgeschlagene Calls …",
+            f"Retrying {len(failed_tasks)} failed calls …",
+        ))
+        with ThreadPoolExecutor(max_workers=parallel) as retry_executor:
+            retry_map = {
+                retry_executor.submit(ask_question, api_key, q, model, lang, web_search, max_tokens, short_answer):
+                    (i, run_num, q, time.time())
+                for i, q, run_num in failed_tasks
+            }
+            for future in as_completed(retry_map):
+                i, run_num, question, t_sub = retry_map[future]
+                if st.session_state.get("stop_requested", False):
+                    break
+                answer, err, usage = future.result()
+                call_elapsed = time.time() - t_sub
+                call_times.append(call_elapsed)
+                p1_timings.append({
+                    "question":  question,
+                    "run":       run_num + 1,
+                    "elapsed_s": round(call_elapsed, 3),
+                    "ok":        answer is not None,
+                })
+                if not answer:
+                    errors.append(tr(
+                        f"Frage {i+1}, Run {run_num+1}: {err}",
+                        f"Question {i+1}, Run {run_num+1}: {err}",
+                    ))
+                    log.warning("Retry failed — Frage %d, Run %d: %s", i+1, run_num+1, err)
+                else:
+                    _record_answer(question, run_num, answer, usage)
+                    log.info("Phase1 retry OK — Frage %d Run %d | len=%d | %.2fs", i+1, run_num+1, len(answer), call_elapsed)
+        _render_live_metrics(metrics_box, len(call_times), len(call_times), time.time() - t_phase1, call_times)
 
     phase1_elapsed = time.time() - t_phase1
     bar1.progress(1.0)
@@ -1811,11 +2148,22 @@ def _run_phase1():
     st.rerun()
 
 
+def _normalize_brand_key(name: str) -> str:
+    """Matching key: lowercase, strip trademark glyphs, drop legal-form suffixes
+    (Inc, GmbH, Ltd, …) and any non-alphanumerics. So 'Nike Inc.', 'nike' and 'NIKE®'
+    all collapse to 'nike'."""
+    key = (name or "").lower()
+    key = re.sub(r"[®™©]", "", key)
+    key = re.sub(r"\b(inc|corp|corporation|gmbh|ltd|limited|llc|ag|co|company|group|the)\b", " ", key)
+    key = re.sub(r"[^a-z0-9]+", "", key)
+    return key
+
+
 def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = None):
     """
-    Phase 2: brand extraction + sentiment for the whole dataset in ONE call to a
-    single strong model (ANALYSIS_MODEL / Claude Opus 4.8). Every answer is numbered
-    and sent together; the model returns a flat JSON array that we regroup per answer.
+    Phase 2: brand extraction + sentiment for the whole dataset, batched across one or
+    more calls to a single strong model (ANALYSIS_MODEL / Claude Opus 4.8). The model
+    returns flat JSON arrays that we regroup per answer.
     """
     cfg      = st.session_state.config
     api_key  = cfg["api_key"]
@@ -1826,22 +2174,39 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
 
     n_answers = len(raw_answers)
 
-    # Map returned brand names to canonical user-specified casing (case-insensitive).
-    # Also filters out unlisted brands in manual mode as a second safety net.
-    brand_lookup: dict[str, str] = {b.strip().lower(): b for b in brands} if brands else {}
+    # Map returned brand names to the canonical user-specified spelling. Matching is
+    # fuzzy (normalized key + substring), so "Nike Inc." still maps to a listed "Nike".
+    brand_lookup: dict[str, str] = {}
+    for b in brands:
+        k = _normalize_brand_key(b)
+        if k:
+            brand_lookup[k] = b.strip()
+    unlisted_seen: dict[str, str] = {}  # brands the model found that aren't in the user's list
 
     def _normalize_brands(brand_list: list[dict]) -> list[dict]:
         out, seen = [], set()
         for b in brand_list:
-            raw_name = b.get("brand", "").strip()
+            raw_name = (b.get("brand") or "").strip()
             if not raw_name:
                 continue
             if brand_lookup:
-                canonical = brand_lookup.get(raw_name.lower())
+                rk = _normalize_brand_key(raw_name)
+                canonical = brand_lookup.get(rk)
                 if canonical is None:
-                    continue  # not in user's list — drop it
+                    # Fuzzy: substring containment either direction, length-guarded to
+                    # avoid matching on a stray couple of characters.
+                    for ck, cval in brand_lookup.items():
+                        if len(ck) >= 3 and (ck in rk or (len(rk) >= 3 and rk in ck)):
+                            canonical = cval
+                            break
+                if canonical is None:
+                    # Not one of the user's brands — keep it aside to surface later
+                    # instead of silently dropping it.
+                    if rk:
+                        unlisted_seen[rk] = raw_name
+                    continue
                 b = {**b, "brand": canonical}
-            key = b["brand"].strip().lower()
+            key = _normalize_brand_key(b["brand"])
             if key in seen:
                 continue  # dedupe within a single answer
             seen.add(key)
@@ -1854,18 +2219,15 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
         f"Analyzing {n_answers} answers in a single pass with `{ANALYSIS_MODEL}`.",
     ))
 
-    # The whole dataset goes into one prompt. Rough input estimate: each answer is
-    # truncated to ANALYSIS_ANSWER_CHARS (~1 token / 4 chars). Warn well before the
-    # 60k TPM limit so a large run doesn't silently get truncated/rejected.
-    est_input_tokens = n_answers * ANALYSIS_ANSWER_CHARS // 4
-    if est_input_tokens > 45000:
-        st.warning(tr(
-            f"Großer Datensatz ({n_answers} Antworten, ~{est_input_tokens:,} Input-Tokens). "
-            "Die Einzel-Prompt-Analyse könnte das Token-Limit überschreiten. Bei Fehlern: "
-            "weniger Fragen/Runs verwenden.",
-            f"Large dataset ({n_answers} answers, ~{est_input_tokens:,} input tokens). "
-            "The single-prompt analysis may exceed the token limit. If it fails, use "
-            "fewer questions/runs.",
+    # Analysis is batched, so a large dataset no longer risks a single truncated call.
+    # Just tell the user how many batches (= calls) to expect.
+    n_batches = len(_make_analysis_batches(raw_answers))
+    if n_batches > 1:
+        st.info(tr(
+            f"Großer Datensatz ({n_answers} Antworten) — Analyse läuft in {n_batches} Batches "
+            "und wird anschließend zusammengeführt.",
+            f"Large dataset ({n_answers} answers) — analysis runs in {n_batches} batches "
+            "and is then merged.",
         ))
 
     bar2        = st.progress(0.0)
@@ -1877,7 +2239,7 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
         f"Analysis running with {ANALYSIS_MODEL} …",
     ))
 
-    by_index, usage, analysis_err = analyze_dataset(api_key, raw_answers, brands, lang)
+    by_index, summary, usage, analysis_err = analyze_dataset(api_key, raw_answers, brands, lang)
     phase2_elapsed = time.time() - t_phase2
     bar2.progress(1.0)
 
@@ -1900,10 +2262,13 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
             "tokens_analysis": analysis_tokens,
             "brands_found":    merged,
         })
+    # In manual mode, remember brands the model found that aren't on the user's list,
+    # so the results view can surface unlisted competitors instead of hiding them.
+    st.session_state.unlisted_brands = sorted(unlisted_seen.values(), key=str.lower) if brands else []
     log.info(
-        "Phase2 OK — %d answers analyzed in one %s call | %.2fs | brands total: %d",
+        "Phase2 OK — %d answers analyzed via %s (batched) | %.2fs | brands total: %d | unlisted: %d",
         n_answers, ANALYSIS_MODEL, phase2_elapsed,
-        sum(len(r["brands_found"]) for r in results),
+        sum(len(r["brands_found"]) for r in results), len(unlisted_seen),
     )
 
     status_line.caption(tr(
@@ -1926,8 +2291,9 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
             for e in errors:
                 st.markdown(f"- {e}")
 
-    st.session_state.results = results
-    st.session_state.step    = 5
+    st.session_state.results          = results
+    st.session_state.analysis_summary = summary
+    st.session_state.step             = 5
     time.sleep(1)
     st.rerun()
 
@@ -2163,6 +2529,18 @@ def render_step5():
                 tr("**Brands (manuell):** ", "**Brands (manual):** ") +
                 (", ".join(f"`{b}`" for b in brands_list) if brands_list else "—")
             )
+            unlisted = st.session_state.get("unlisted_brands", [])
+            if unlisted:
+                shown = ", ".join(f"`{b}`" for b in unlisted[:25])
+                more  = tr(f" … (+{len(unlisted) - 25} weitere)", f" … (+{len(unlisted) - 25} more)") if len(unlisted) > 25 else ""
+                st.markdown(tr(
+                    "**Ebenfalls genannt (nicht in deiner Liste):** ",
+                    "**Also mentioned (not in your list):** ",
+                ) + shown + more)
+                st.caption(tr(
+                    "Diese Marken kamen in den Antworten vor, werden aber nicht in den Charts getrackt.",
+                    "These brands appeared in the answers but are not tracked in the charts.",
+                ))
         else:
             st.markdown(tr(
                 "**Brand-Erkennung:** Automatisch (aus Antworten extrahiert)",
@@ -2186,18 +2564,103 @@ def render_step5():
 
     df = build_analysis(results)
 
-    # --- KPI row: one metric per brand --------------------------------------
-    if not df.empty:
-        brands     = sorted(df["brand"].unique().tolist())
-        total_runs = len(results)
-        cols       = st.columns(max(len(brands), 1))
+    # --- Confidence filter -------------------------------------------------
+    # Every chart/table below is driven off `df`, so filtering here narrows the
+    # whole view. Applied before any KPI is computed. Mentions with an unknown
+    # confidence are always kept (older runs, or a model that omitted the field).
+    if not df.empty and "confidence" in df.columns:
+        present = [c for c in ("high", "medium", "low") if c in set(df["confidence"])]
+        if present:
+            selected_conf = st.multiselect(
+                tr("Konfidenz-Filter", "Confidence filter"),
+                options=present,
+                default=present,
+                help=tr(
+                    "Nur Marken-Nennungen mit der gewählten Analyse-Konfidenz anzeigen. "
+                    "Nennungen ohne Konfidenz-Angabe bleiben immer sichtbar.",
+                    "Show only brand mentions with the selected analysis confidence. "
+                    "Mentions without a confidence value always stay visible.",
+                ),
+            )
+            allowed = set(selected_conf) | {"", None}
+            df = df[df["confidence"].isin(allowed)]
+            if selected_conf and len(selected_conf) < len(present):
+                st.caption(tr(
+                    f"Gefiltert auf Konfidenz: {', '.join(selected_conf)}.",
+                    f"Filtered to confidence: {', '.join(selected_conf)}.",
+                ))
 
-        for col, brand in zip(cols, brands):
-            mentions    = int(df[df["brand"] == brand]["mentions"].sum())
-            sov         = round(mentions / total_runs * 100, 1)
-            sent_counts = df[df["brand"] == brand].groupby("sentiment")["mentions"].sum()
-            top_sent    = sent_counts.idxmax() if not sent_counts.empty else "n/a"
-            col.metric(brand, f"{sov}% Share of Voice", tr(f"Sentiment: {top_sent}", f"Sentiment: {top_sent}"))
+    # --- Overview ----------------------------------------------------------
+    # High-level KPIs (responses / questions / brands / leader), the model's
+    # short textual analysis, and a mention-comparison chart.
+    st.subheader(tr("Überblick", "Overview"))
+
+    total_responses = len(results)
+    total_questions = len({r["question"] for r in results})
+    n_brands        = int(df["brand"].nunique()) if not df.empty else 0
+
+    # Answer coverage per brand = number of answers that mention the brand (brands are
+    # deduped within an answer during analysis, so summing "mentions" gives coverage).
+    coverage = (
+        df.groupby("brand")["mentions"].sum().sort_values(ascending=False)
+        if not df.empty else pd.Series(dtype="int64")
+    )
+    top_brand   = coverage.index[0] if not coverage.empty else "—"
+    top_cover   = int(coverage.iloc[0]) if not coverage.empty else 0
+    top_pct     = round(top_cover / total_responses * 100, 1) if total_responses else 0.0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(tr("Antworten", "Responses"), total_responses,
+              help=tr("Erfolgreich gesammelte Antworten (Fragen × Runs).",
+                      "Successfully collected answers (questions × runs)."))
+    k2.metric(tr("Fragen", "Questions"), total_questions,
+              help=tr("Eindeutige Fragestellungen im Datensatz.", "Distinct questions in the dataset."))
+    k3.metric(tr("Erkannte Marken", "Brands detected"), n_brands)
+    k4.metric(tr("Top-Marke", "Top brand"), top_brand if top_brand != "—" else "—",
+              f"{top_cover}/{total_responses} ({top_pct}%)" if top_cover else None,
+              help=tr("Marke mit der höchsten Antwortabdeckung.", "Brand with the highest answer coverage."))
+
+    # --- Brief textual analysis (from the single Opus analysis call) --------
+    summary = st.session_state.get("analysis_summary", "")
+    if summary:
+        st.markdown(f"**{tr('Kurzanalyse', 'Brief analysis')}**")
+        st.info(summary)
+
+    # --- Mention comparison ------------------------------------------------
+    if not coverage.empty:
+        st.markdown(f"**{tr('Nennungen im Vergleich', 'Mentions compared')}**")
+        top_n   = coverage.head(15).sort_values(ascending=True)
+        comp_df = pd.DataFrame({
+            "brand":    top_n.index,
+            "coverage": top_n.values,
+            "pct":      (top_n.values / total_responses * 100) if total_responses else top_n.values,
+        })
+        fig_cmp = px.bar(
+            comp_df,
+            x="coverage",
+            y="brand",
+            orientation="h",
+            text=[f"{c} ({p:.0f}%)" for c, p in zip(comp_df["coverage"], comp_df["pct"])],
+            labels={
+                "coverage": tr("Antworten mit mindestens einer Nennung", "Answers with at least one mention"),
+                "brand": "",
+            },
+            color_discrete_sequence=["#3b6ea5"],
+        )
+        fig_cmp.update_traces(textposition="outside")
+        fig_cmp.update_layout(
+            showlegend=False,
+            xaxis_range=[0, max(total_responses, int(coverage.max())) * 1.15],
+            height=max(220, 30 * len(comp_df) + 90),
+            margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        )
+        st.plotly_chart(fig_cmp, width="stretch")
+        st.caption(tr(
+            f"Antwortabdeckung je Marke (max. {total_responses}). "
+            "Prozent = Anteil aller Antworten mit mindestens einer Nennung.",
+            f"Answer coverage per brand (max {total_responses}). "
+            "Percent = share of all answers with at least one mention.",
+        ))
 
     st.divider()
 
@@ -2262,6 +2725,28 @@ def render_step5():
             fig.update_traces(textposition="outside")
             fig.update_layout(showlegend=False, xaxis_range=[0, 110])
             st.plotly_chart(fig, width="stretch")
+
+            # Prominence: average position of each brand within the answers that mention
+            # it (1 = first brand named). Share of voice counts presence; this shows how
+            # early a brand tends to appear, which matters as much as how often.
+            if "rank" in df.columns and df["rank"].notna().any():
+                prom = (
+                    df.dropna(subset=["rank"])
+                    .groupby("brand")["rank"]
+                    .mean()
+                    .round(2)
+                    .sort_values()
+                    .reset_index()
+                    .rename(columns={"brand": tr("Marke", "Brand"),
+                                     "rank": tr("Ø Position", "Avg. position")})
+                )
+                if not prom.empty:
+                    st.markdown(f"**{tr('Prominenz — Ø Position in der Antwort', 'Prominence — avg. position in the answer')}**")
+                    st.caption(tr(
+                        "Niedriger = die Marke wird tendenziell früher genannt (1 = zuerst).",
+                        "Lower = the brand tends to be named earlier (1 = first).",
+                    ))
+                    st.dataframe(prom, width="stretch", hide_index=True)
 
             # Heatmap: brand × question, using Q1/Q2/… labels
             st.subheader(tr("Sentiment-Heatmap: Brand × Frage", "Sentiment heatmap: Brand × Question"))
