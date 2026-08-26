@@ -5,3 +5,11 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# API key — never commit
+key.txt
+
+# Support evidence: raw request/response transcripts. Contain no key (only a
+# fingerprint), but they are run artefacts, not source.
+support_evidence.jsonl
+support/evidence/
