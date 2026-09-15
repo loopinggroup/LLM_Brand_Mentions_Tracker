@@ -119,7 +119,7 @@ Standardmäßig laufen die Anfragen über die EU-Server. Falls Ihr Langdock-Work
 LANGDOCK_REGION=us streamlit run app.py
 ```
 
-> Das betrifft nur die drei direkten Anbieter-Endpoints. Die Agent-API (Websuche) hat keine Region in der Adresse.
+> Das betrifft nur die Analyse (Anthropic-Endpoint). Fragengenerierung und Antwortsammlung laufen über die Agent-API, die keine Region in der Adresse hat.
 
 ---
 
@@ -128,11 +128,11 @@ LANGDOCK_REGION=us streamlit run app.py
 Die App führt Sie durch einen festen Ablauf. Oben rechts lässt sich jederzeit zwischen Deutsch und Englisch umschalten — das gilt für die Oberfläche **und** für die Sprache, in der die Modelle antworten.
 
 ```
-Schritt 1  Einrichtung        API-Key, Modell, Thema, Marken
+Schritt 1  Verbindung & Modelle   API-Key, Modelle (Mehrfachauswahl), Verbindungstest
     ↓
-Schritt 2  Fragen prüfen      Generierte Fragen bearbeiten
+Schritt 2  Fragen & Brands       Fragen generieren/eingeben, Brand-Erkennung
     ↓
-Schritt 3  Runs konfigurieren Wie oft? Wie viele parallel? Websuche?
+Schritt 3  Übersicht & Optionen  Alles auf einen Blick, Websuche, Extended Thinking, Runs
     ↓
     ⚙️  PHASE 1 — Antworten sammeln  (viele API-Calls)
     ↓
@@ -143,30 +143,28 @@ Schritt 4  Rohdaten prüfen    Kontrollpunkt vor den Analysekosten
 Schritt 5  Ergebnisse         Diagramme, Tabellen, Export
 ```
 
-### Schritt 1 — Einrichtung
+Alle Eingaben aus Schritt 1–3 bleiben erhalten, wenn Sie zwischen den Schritten vor- und zurückspringen. „Neuen Prozess starten" behält API-Key und Modellauswahl und leert den Rest.
 
-Hier legen Sie fest:
+### Schritt 1 — Verbindung & Modelle
+
 - **API-Key** — wird nur im Arbeitsspeicher gehalten, nicht gespeichert.
-- **Websuche an/aus** — standardmäßig **an**. Das ist eine folgenreiche Entscheidung, weil sie den kompletten technischen Weg umschaltet (siehe unten).
-- **Modell** — die Liste wird live aus Ihrem Workspace geladen.
-- **Fragen-Modus** — automatisch generieren (Thema angeben) oder eigene Fragen tippen.
+- **Modelle** — Mehrfachauswahl, live aus Ihrem Workspace geladen (`GET /agent/v1/models`). Jede Frage wird mit jedem gewählten Modell gestellt. Das **zuerst gewählte** Modell generiert in Schritt 2 die Fragen.
+- **Verbindung testen** — ein Mini-Aufruf pro Modell (parallel), der Key und Modell-IDs prüft, bevor ein langer Lauf startet. **Diesen Button sollten Sie immer benutzen.**
+
+### Schritt 2 — Fragen & Brands
+
+- **Fragen-Modus** — automatisch generieren (Thema + Anzahl angeben, Button „Fragen generieren") oder eigene Fragen tippen. Das Ergebnis landet in einem großen Textfeld, eine Frage pro Zeile, frei editierbar. Nur was dort steht, wird gefragt.
 - **Brand-Erkennung** — eigene Marken vorgeben oder alle Marken automatisch erkennen lassen.
-- **Verbindung testen** — ein einzelner Mini-Aufruf, der Key und Modellnamen prüft, bevor ein langer Lauf startet. **Diesen Button sollten Sie immer benutzen.**
 
-### Schritt 2 — Fragen prüfen
+### Schritt 3 — Übersicht & Optionen
 
-Ein großes Textfeld, eine Frage pro Zeile. Sie können frei bearbeiten, löschen, ergänzen. Nur was hier steht, wird tatsächlich gefragt. Leerzeilen werden ignoriert.
+Die wichtigste Seite für Kosten und Laufzeit. Sie liest sich von oben nach unten:
 
-### Schritt 3 — Runs konfigurieren
-
-Die wichtigste Seite für Kosten und Laufzeit:
-- **Runs pro Frage** (1–100): Wie oft jede Frage wiederholt wird.
-- **Modelle**: Mehrfachauswahl möglich — jede Frage wird dann mit jedem Modell gestellt.
-- **Parallele API-Calls** (1–10, Standard 2): Wie viele Anfragen gleichzeitig.
-- **Extended Thinking**: Das Modell denkt länger nach. Nur für Modelle, die das können.
-- **Kurzantwort-Modus**: Das Modell antwortet nur mit einer Stichpunktliste „Marke — ein Satz". Deutlich billiger und schneller.
-- **Markt/Region**: z. B. „Deutschland". Wird über den Prompt gesteuert, da Langdock keinen Standort-Parameter kennt.
-- **Max. Tokens** und **Pause zwischen Calls** — nur ohne Websuche relevant.
+1. **Einstellungen prüfen** — je ein Block für Verbindung & Modelle, Fragen und Brand-Erkennung, jeweils mit „Bearbeiten"-Sprung zurück.
+2. **Optionen festlegen**
+   - *Antwortverhalten:* **Websuche** (standardmäßig **an**; aus = nur Trainingswissen — beide Varianten laufen über die Agent-API, deshalb bleibt die Modellauswahl gültig), **Extended Thinking** (nur wählbar, wenn alle gewählten Modelle es unterstützen), **Kurzantwort-Modus** („Marke — ein Satz", billiger und schneller).
+   - *Umfang:* **Runs pro Frage** (1–100) und **parallele Calls** (1–10, Standard 2).
+3. **Lauf starten** — Rechnung Fragen × Runs × Modelle, was in Phase 1 und Phase 2 passiert (inklusive des automatisch ermittelten Analyse-Modells), dann der Start-Button.
 
 Die Kostenformel wird live angezeigt:
 > **Fragen × Runs × Modelle = Anzahl Sammel-Calls**
@@ -175,7 +173,7 @@ Die Kostenformel wird live angezeigt:
 
 Bewusst als Zwischenstopp eingebaut: Die teuren Sammel-Calls sind bezahlt, die Analyse-Calls noch nicht. Hier sehen Sie:
 - Wie viele Antworten gesammelt wurden, wie viele fehlschlugen.
-- **Wurde die Websuche tatsächlich genutzt?** — mit drei Belegarten (Details: [Code-Erklärung 2.14](docs/CODE.md)).
+- **Wurde die Websuche tatsächlich genutzt?** — mit drei Belegarten (Details: [Code-Erklärung 2.14](docs/CODE.md)). Die Spalte „🔍 Websuche erfolgreich · Quellen" zeigt das je Antwort samt Anzahl der gelieferten Quellen.
 - Alle Antworten im Volltext, inklusive der zitierten Quellen.
 - Export als CSV oder JSON — **auch ohne Analyse**.
 
@@ -189,7 +187,7 @@ Fünf Tabs:
 | **Share of Voice** | Balkendiagramm der Nennungsanteile, Prominenz-Tabelle, Sentiment-Heatmap Marke × Frage |
 | **Sentiment** | Prozentverteilung je Marke, gestapeltes Balkendiagramm, alle Belegzitate |
 | **Alle Antworten** | Volltexte, filterbar nach Frage |
-| **Rohdaten** | Tabelle mit Tokenverbrauch je Antwort |
+| **Rohdaten** | Tabelle aller Antworten mit erkannten Marken |
 | **Laufzeit** | Wie lange dauerten die Calls? Histogramm und Detailtabelle |
 
 Darüber ein **Konfidenz-Filter**, der alle Ansichten gleichzeitig einschränkt.
@@ -244,8 +242,8 @@ Dieser Abschnitt ist bewusst ausführlich. Vieles davon ist **kein Programmierfe
 | Problem | Erklärung |
 |---|---|
 | **Die Schieberegler erlauben extreme Werte** | 200 Fragen × 100 Runs × mehrere Modelle = über 20.000 Aufrufe. Es gibt **keine Sicherheitsabfrage** und keine Obergrenze. Die Zahl wird angezeigt — man muss sie lesen. |
-| **Kein Tokenverbrauch bei Websuche** | Die Agent-API meldet nichts. Alle Tabellen zeigen 0. Die tatsächlichen Kosten sieht man nur im Langdock-Dashboard. |
-| **Das Analyse-Modell ist das teuerste im Lauf** | Claude Opus ist fest eingestellt (Zeile 159). Bei großen Datensätzen ist Phase 2 spürbar teuer, obwohl es nur wenige Aufrufe sind. |
+| **Kein Tokenverbrauch der Sammlung** | Die Agent-API meldet nichts, deshalb gibt es keine Token-Spalten für die Antworten. Die tatsächlichen Kosten sieht man nur im Langdock-Dashboard. |
+| **Das Analyse-Modell ist das teuerste im Lauf** | Es wird automatisch das neueste Claude Opus gewählt. Bei großen Datensätzen ist Phase 2 spürbar teuer, obwohl es nur wenige Aufrufe sind. |
 | **Mehrfachauswahl von Modellen multipliziert** | Zwei Modelle = doppelte Kosten. Der Regler „Runs" wirkt zusätzlich multiplikativ. |
 
 **Empfehlung für einen ersten Lauf:** 5 Fragen × 1 Run × 1 Modell. Erst wenn die Kette funktioniert, hochskalieren.
@@ -256,10 +254,9 @@ Der häufigste Fehlerherd überhaupt.
 
 | Problem | Symptom | Lösung |
 |---|---|---|
-| **Zwei getrennte Kataloge** | Modell funktioniert mit Websuche, aber nicht ohne (oder umgekehrt) | Nach dem Umschalten der Websuche das Modell neu wählen |
 | **Widersprüchliche Server** | Dasselbe Modell schlägt sporadisch mit „is not available" fehl | Das Tool wiederholt bereits automatisch bis zu 4×. Bei anhaltendem Fehler: 🔄 Liste neu laden |
 | **Deployment-IDs ändern sich** | Ein früher funktionierendes Modell verschwindet | Neu laden, neu auswählen. Nichts ist fest im Code hinterlegt |
-| **Analyse-Modell fest verdrahtet** | Phase 2 schlägt komplett fehl, Phase 1 lief einwandfrei | Zeile 159 auf ein verfügbares Modell ändern |
+| **Opus-Liste nicht abrufbar** | Schritt 3 zeigt „Standardmodell wird verwendet", Phase 2 schlägt evtl. fehl | Das neueste Opus wird live vom Anthropic-Endpoint gelesen. Klappt das nicht, greift `ANALYSIS_MODEL_FALLBACK` (Zeile 206) — bei Bedarf dort anpassen |
 | **Freitext-Modellfeld** | Bei fehlender Modellliste muss man den Namen exakt kennen | Erst API-Key prüfen, dann Verbindungstest |
 
 ### Rate Limits und Zeitverhalten
@@ -278,10 +275,9 @@ Das sind die Punkte, die man kennen **muss**, bevor man Ergebnisse präsentiert.
 | Problem | Erklärung | Gegenmaßnahme |
 |---|---|---|
 | **Die Websuche ist nicht erzwingbar** | `capabilities.webSearch` stellt das Werkzeug nur bereit. Kleinere Modelle nutzen es trotz ausdrücklicher Anweisung manchmal nicht. | Die Prüfung in Schritt 4 ernst nehmen. Bei roter Meldung: stärkeres Modell wählen. |
-| **Antworten werden für die Analyse auf 2.000 Zeichen gekürzt** | 70 % Anfang + 30 % Ende. Marken **in der Mitte** langer Antworten können übersehen werden. | `ANALYSIS_ANSWER_CHARS` erhöhen (Zeile 161) oder Kurzantwort-Modus nutzen. |
+| **Antworten werden für die Analyse auf 2.000 Zeichen gekürzt** | 70 % Anfang + 30 % Ende. Marken **in der Mitte** langer Antworten können übersehen werden. | `ANALYSIS_ANSWER_CHARS` erhöhen (Zeile 208) oder Kurzantwort-Modus nutzen. |
 | **Das Sentiment ist ein KI-Urteil** | Ein Modell entscheidet über positiv/neutral/negativ. Das ist nicht objektiv und nicht perfekt reproduzierbar — auch wenn Temperatur 0 hilft. | Konfidenz-Filter nutzen, Belegzitate stichprobenartig prüfen. |
 | **Fuzzy-Markenabgleich kann falsch treffen** | Teilstring-Suche in beide Richtungen ab 3 Zeichen: „Apple" trifft auch „Applebee's". | Bei kurzen/generischen Markennamen die Rohdaten kontrollieren. |
-| **Der Markt ist nur eine Prompt-Bitte** | Langdock hat keinen Standort-Parameter. Es gibt keine Garantie für marktspezifische Quellen. | Ergebnisse entsprechend vorsichtig interpretieren. |
 | **Temperatur 0.7 erzeugt Streuung** | Absicht — sonst wären Wiederholungen wertlos. Aber: Zwei Läufe mit gleicher Konfiguration liefern **nicht** dieselben Zahlen. | Für Vergleiche über die Zeit immer dieselbe Konfiguration und ausreichend viele Runs verwenden. |
 | **Wenige Runs = keine Statistik** | Bei 1 Run pro Frage ist jedes Ergebnis eine Einzelbeobachtung. | Mindestens 3, besser 5–10 Runs für belastbare Aussagen. |
 | **Automatischer Modus erzeugt viele Marken** | Ohne vorgegebene Liste erkennt das Modell alles Markenähnliche — auch generische Begriffe. Der Long Tail wird unübersichtlich. | Für gezielte Fragestellungen den manuellen Modus verwenden. |
@@ -299,8 +295,7 @@ Das sind die Punkte, die man kennen **muss**, bevor man Ergebnisse präsentiert.
 | **`support_evidence.jsonl` wächst ebenfalls** | Und enthält vollständige Anfrageinhalte. |
 | **Python 3.10 ist Mindestvoraussetzung** | Wegen der Schreibweise `str \| None`. Ältere Versionen starten nicht. |
 | **Bei über ~40 Marken wird der Sentiment-Tab unlesbar** | Eine Bildschirmspalte je Marke. |
-| **Der Fortschrittsbalken sagt „von 4", es gibt aber 5 Schritte** | Kosmetische Ungenauigkeit — Schritt 5 zeigt Ergebnisse und wird nicht mitgezählt. |
-| **Eine lokale Variable heißt wie eine globale** | In `render_step4` (Zeile 3414) heißt eine Hilfsvariable `evidence` — genau wie der globale `EvidenceRecorder` aus Zeile 60. Innerhalb dieser Funktion überdeckt sie ihn. Das ist funktional unbedenklich (der Recorder wird dort nicht benutzt), beim Lesen aber verwirrend. |
+| **Eine lokale Variable heißt wie eine globale** | In `render_step4` (Zeile 3238) heißt eine Hilfsvariable `evidence` — genau wie der globale `EvidenceRecorder` aus Zeile 60. Innerhalb dieser Funktion überdeckt sie ihn. Das ist funktional unbedenklich (der Recorder wird dort nicht benutzt), beim Lesen aber verwirrend. |
 
 ### Was das Tool bewusst **nicht** kann
 
@@ -341,17 +336,17 @@ Alle vier Versuche sind gescheitert. Das Modell wurde für diesen Lauf stillgele
 ### „Abgebrochen — API-Limit erreicht: …"
 Die Notbremse hat gegriffen — meist ein erreichtes Budget-/Ausgabelimit des Workspace. Weitere Versuche würden nichts bringen. **Die bis dahin gesammelten Antworten bleiben erhalten** und können in Schritt 4 exportiert oder analysiert werden. Zuerst das Limit in Langdock prüfen.
 
-### „Token-Budget erschöpft (max_tokens=8000)."
-Ein Reasoning-Modell hat sein Budget beim internen Nachdenken verbraucht. In Schritt 3 „Max. Tokens" erhöhen (bis 16000). Erscheint nur ohne Websuche — bei der Agent-API gibt es diesen Regler nicht.
+### „Token-Budget erschöpft (max_tokens=…)."
+Kann nur noch in der Analyse auftreten (die Sammlung läuft über die Agent-API, die kein Token-Limit kennt). `DATASET_ANALYSIS_MAX_TOKENS` (Zeile 207) erhöhen oder `ANALYSIS_BATCH_MAX_ANSWERS` senken.
 
 ### „Timeout nach 180s." / „Timeout nach 240s."
-Das Modell hat zu lange gebraucht. Mögliche Ursachen: hohe Last, sehr aufwendige Websuche, sehr langer Prompt. Weniger parallele Aufrufe einstellen oder in Zeile 151/152 höher setzen.
+Das Modell hat zu lange gebraucht. Mögliche Ursachen: hohe Last, sehr aufwendige Websuche, sehr langer Prompt. Weniger parallele Aufrufe einstellen oder in Zeile 196/197 höher setzen.
 
 ### „Es konnten keine Fragen aus der Antwort extrahiert werden."
-Das Modell hat auf die Aufforderung nach einem JSON-Array mit Prosa geantwortet. Ein anderes Modell probieren, oder in Schritt 1 auf eigene Fragen umstellen. Im Log steht unter `PARSED ZERO` der Anfang der tatsächlichen Antwort.
+Das Modell hat auf die Aufforderung nach einem JSON-Array mit Prosa geantwortet. Ein anderes Modell probieren, oder in Schritt 2 auf eigene Fragen umstellen. Im Log steht unter `PARSED ZERO` der Anfang der tatsächlichen Antwort.
 
 ### „Ein Analyse-Batch konnte nicht als JSON gelesen werden (evtl. abgeschnitten)."
-Die JSON-Ausgabe des Analyse-Modells wurde vermutlich abgeschnitten. `ANALYSIS_BATCH_MAX_ANSWERS` (Zeile 312) auf z. B. 25 senken und über den Button in Schritt 5 neu analysieren — das kostet keine neuen Sammel-Aufrufe.
+Die JSON-Ausgabe des Analyse-Modells wurde vermutlich abgeschnitten. `ANALYSIS_BATCH_MAX_ANSWERS` (Zeile 359) auf z. B. 25 senken und über den Button in Schritt 5 neu analysieren — das kostet keine neuen Sammel-Aufrufe.
 
 ### „🔍 Keine Antwort hat das Such-Tool nachweislich genutzt."
 Die Modelle haben aus ihrem Trainingswissen geantwortet. Ein stärkeres Modell wählen (kleine Modelle ignorieren die Suchanweisung häufiger) und prüfen, ob die Websuche in Schritt 3 wirklich aktiv war. Bei zeitlosen Fragen ist es kein Fehler — dort ist Suchen tatsächlich unnötig.
@@ -396,14 +391,14 @@ Sollte durch den Schutz in Zeile 39 nicht passieren. Falls doch: Streamlit volls
 | `support_evidence.jsonl` | **Vollständige Anfrageinhalte inklusive aller Prompts und Fragen**, ungekürzte Fehlerantworten, Antwort-Header | ⚠️ **Erhöht** — vor Weitergabe hineinschauen |
 | `results/*.csv` | Fragen, Antworten (auf 500 Zeichen gekürzt), Markenzuordnungen | Abhängig vom Thema |
 
-Der Code weist an Zeile 1210 selbst darauf hin:
+Der Code weist an Zeile 1151 selbst darauf hin:
 > *„…und es ENTHÄLT DEN PROMPT-TEXT — einen Blick wert, bevor diese Datei nach außen gegeben wird."*
 
 ### Was an Langdock übertragen wird
 
 Jede Frage, jeder Prompt und jede Marke, die Sie eingeben, geht an Langdock und von dort an den jeweiligen KI-Anbieter. Bei aktiver Websuche werden zusätzlich Suchanfragen an eine Suchmaschine gestellt.
 
-**Praktische Konsequenz:** Keine vertraulichen Produktnamen, unveröffentlichten Projektbezeichnungen oder personenbezogenen Daten in die Fragen schreiben. Die Region `eu` sorgt für EU-Verarbeitung bei den drei direkten Endpoints — **die Agent-API hat allerdings keine Region in der Adresse** (Zeile 143). Wo genau sie verarbeitet, sollte bei Bedarf mit Langdock geklärt werden.
+**Praktische Konsequenz:** Keine vertraulichen Produktnamen, unveröffentlichten Projektbezeichnungen oder personenbezogenen Daten in die Fragen schreiben. Die Region `eu` sorgt für EU-Verarbeitung beim Analyse-Endpoint — **die Agent-API, über die alle Fragen gestellt werden, hat allerdings keine Region in der Adresse** (Zeile 188). Wo genau sie verarbeitet, sollte bei Bedarf mit Langdock geklärt werden.
 
 ### Betrieb im Netzwerk
 
@@ -417,26 +412,26 @@ Alle wichtigen Werte stehen als Konstanten am Anfang der Datei. Zum Anpassen gen
 
 | Was | Zeile | Standard | Wirkung beim Ändern |
 |---|---|---|---|
-| `LANGDOCK_REGION` | 137 | `eu` | Umgebungsvariable beim Start, nicht im Code ändern |
-| `REQUEST_TIMEOUT` | 151 | 180 s | Höher, wenn Modelle regelmäßig in den Timeout laufen |
-| `AGENT_STREAM_TIMEOUT` | 152 | 240 s | Höher bei sehr aufwendigen Suchen |
-| `MAX_TOKENS` | 153 | 8000 | Standardwert des Reglers in Schritt 3 |
-| `QUESTION_MAX_TOKENS` | 154 | 16000 | Budget der Fragengenerierung |
-| **`ANALYSIS_MODEL`** | **159** | `claude-opus-4-8` | **Wichtigste Stellschraube** — ändern, falls das Modell nicht verfügbar ist |
-| `DATASET_ANALYSIS_MAX_TOKENS` | 160 | 16000 | Ausgabebudget je Analyse-Batch |
-| `ANALYSIS_ANSWER_CHARS` | 161 | 2000 | Höher = weniger Kürzung, mehr Kosten |
-| `COLLECTION_TEMPERATURE` | 169 | 0.7 | Niedriger = einheitlichere Antworten (Wiederholungen verlieren an Wert) |
-| `QUESTION_TEMPERATURE` | 170 | 0.8 | Niedriger = konventionellere Fragen |
-| `ANALYSIS_TEMPERATURE` | 171 | 0.0 | Nicht erhöhen — Reproduzierbarkeit geht verloren |
-| `_FATAL_LIMIT_RE` | 249 | siehe Code | Suchmuster für endgültige Limits. Erweitern nur mit Bedacht |
-| `ANALYSIS_BATCH_MAX_ANSWERS` | 312 | 40 | Kleiner = mehr Aufrufe, geringeres Abschneide-Risiko |
-| `ANALYSIS_BATCH_MAX_INPUT_TOKENS` | 313 | 40000 | Eingabegrenze je Batch |
-| `ANALYSIS_ANSWER_HEAD_FRAC` | 317 | 0.7 | Verhältnis Anfang/Ende bei der Kürzung |
-| `AGENT_MODELS_TTL` | 480 | 60 s | Wie lange die Modellliste zwischengespeichert wird |
-| Agent-`instructions` | 1177 | siehe Code | Der Text, der das Modell zum Suchen bewegt |
-| Prompts der Fragengenerierung | 1486 | siehe Code | Welche Art Fragen erzeugt wird |
-| Prompts der Antwortsammlung | 1589 | siehe Code | **Nur mit Bedacht ändern** — beeinflusst das Messergebnis direkt |
-| Analyse-Prompt | 1828 | siehe Code | Welche Felder erkannt werden |
+| `LANGDOCK_REGION` | 182 | `eu` | Umgebungsvariable beim Start, nicht im Code ändern |
+| `REQUEST_TIMEOUT` | 196 | 180 s | Höher, wenn Analyse-Calls regelmäßig in den Timeout laufen |
+| `AGENT_STREAM_TIMEOUT` | 197 | 240 s | Höher bei sehr aufwendigen Suchen |
+| `MAX_TOKENS` | 198 | 8000 | Standardbudget für Passthrough-Calls |
+| `QUESTION_MAX_TOKENS` | 199 | 16000 | Wird nur protokolliert — die Agent-API kennt kein Token-Limit |
+| **`ANALYSIS_MODEL_FALLBACK`** | **206** | `claude-opus-4-8` | Nur wenn das neueste Opus nicht live ermittelt werden kann (`resolve_analysis_model`) |
+| `DATASET_ANALYSIS_MAX_TOKENS` | 207 | 16000 | Ausgabebudget je Analyse-Batch |
+| `ANALYSIS_ANSWER_CHARS` | 208 | 2000 | Höher = weniger Kürzung, mehr Kosten |
+| `COLLECTION_TEMPERATURE` | 216 | 0.7 | Niedriger = einheitlichere Antworten (Wiederholungen verlieren an Wert) |
+| `QUESTION_TEMPERATURE` | 217 | 0.8 | Niedriger = konventionellere Fragen |
+| `ANALYSIS_TEMPERATURE` | 218 | 0.0 | Nicht erhöhen — Reproduzierbarkeit geht verloren |
+| `_FATAL_LIMIT_RE` | 296 | siehe Code | Suchmuster für endgültige Limits. Erweitern nur mit Bedacht |
+| `ANALYSIS_BATCH_MAX_ANSWERS` | 359 | 40 | Kleiner = mehr Aufrufe, geringeres Abschneide-Risiko |
+| `ANALYSIS_BATCH_MAX_INPUT_TOKENS` | 360 | 40000 | Eingabegrenze je Batch |
+| `ANALYSIS_ANSWER_HEAD_FRAC` | 364 | 0.7 | Verhältnis Anfang/Ende bei der Kürzung |
+| `AGENT_MODELS_TTL` | 522 | 60 s | Wie lange die Modellliste zwischengespeichert wird |
+| Agent-`instructions` | 1102 | siehe Code | Der Text, der das Modell zum Suchen bewegt |
+| Prompts der Fragengenerierung | 1431 | siehe Code | Welche Art Fragen erzeugt wird |
+| Prompts der Antwortsammlung | 1531 | siehe Code | **Nur mit Bedacht ändern** — beeinflusst das Messergebnis direkt |
+| Analyse-Prompt | 1753 | siehe Code | Welche Felder erkannt werden |
 
 ---
 
@@ -462,7 +457,7 @@ Damit diese Datei schlank bleibt, liegen die ausführlichen Teile in eigenen Dok
 
 | Datei / Ordner | Inhalt | Im Git? |
 |---|---|---|
-| `app.py` | Die komplette Anwendung — Oberfläche, API-Anbindung, Analyse (~4.280 Zeilen) | ✅ |
+| `app.py` | Die komplette Anwendung — Oberfläche, API-Anbindung, Analyse (~4.100 Zeilen) | ✅ |
 | `langdock_evidence.py` | Protokolliert Agent-API-Anfragen für Langdock-Support-Tickets | ✅ |
 | `requirements.txt` | Die vier benötigten Bibliotheken | ✅ |
 | `docs/GLOSSAR.md` | Begriffserklärungen | ✅ |

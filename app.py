@@ -87,17 +87,61 @@ def init_state():
         "phase1_complete": False,  # False + raw_answers present ⇒ a run was interrupted
         "timing":         {},   # phase wall times + per-call elapsed data
         "lang":           "de", # UI + model response language: "de" or "en"
+        "selected_models": [],  # effective model selection from Step 1 (catalog pick or manual IDs)
+        "conn_test":      {},   # last connection test: {"key": fingerprint, "results": {model: (ok, msg)}}
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    for k, v in _WIDGET_DEFAULTS.items():
+        if k not in st.session_state:
+            st.session_state[k] = list(v) if isinstance(v, list) else v
+
+# ---------------------------------------------------------------------------
+# Setup widgets (Steps 1–3)
+#
+# Every setup widget is keyed and reads its value ONLY from session state (no
+# `value=` / `default=` argument). Streamlit deletes a widget's state at the end of
+# any run in which the widget wasn't rendered — i.e. on every step change — so going
+# back from Step 2 to Step 1 used to show empty fields. Re-assigning each key at the
+# top of every run is Streamlit's documented way to keep that state alive.
+#
+# Radio options are stable codes ("generate", "manual", …) rendered via format_func,
+# so switching the language cannot leave a stored value outside the option list.
+# ---------------------------------------------------------------------------
+_WIDGET_DEFAULTS = {
+    "w_api_key":           "",
+    "w_models":            [],
+    "w_models_manual":     "",       # only used when the model catalog can't be loaded
+    "w_question_mode":     "generate",
+    "w_topic":             "",
+    "w_n_questions":       20,
+    "w_questions_text":    "",
+    "w_brand_mode":        "manual",
+    "w_brands":            "",
+    "w_web_search":        True,
+    "w_extended_thinking": False,
+    "w_short_answer":      False,
+    "w_runs":              2,
+    "w_parallel":          2,
+}
+
+# Kept on "start new process": the connection setup is what a user reuses.
+_KEEP_ON_RESET = ("w_api_key", "w_models", "w_models_manual", "selected_models", "conn_test", "lang", "lang_selector")
+
+
+def keep_widget_state():
+    for k in _WIDGET_DEFAULTS:
+        if k in st.session_state:
+            st.session_state[k] = st.session_state[k]
 
 init_state()
+keep_widget_state()
 
 def reset_process():
-    """Clears everything but the language preference and restarts at Step 1."""
-    for key in ["step", "config", "questions", "raw_answers", "phase1_errors", "phase1_complete", "results", "unlisted_brands", "analysis_summary", "timing"]:
-        if key in st.session_state:
+    """Clears the run and the question/brand/option inputs, keeps language, API key and models."""
+    for key in list(st.session_state.keys()):
+        if key not in _KEEP_ON_RESET:
             del st.session_state[key]
     init_state()
     st.rerun()
@@ -148,15 +192,17 @@ AGENT_MODELS_URL    = "https://api.langdock.com/agent/v1/models"
 # Sentinel sent to the passthrough endpoint to make it reply with its accepted model
 # IDs (see _probe_models). Must be a name no workspace can actually have.
 _PROBE_MODEL_ID     = "__langdock_model_probe__"
-REQUEST_TIMEOUT     = 180   # gpt-5-mini (reasoning) regularly takes 30-56s but spikes under parallel load; 120s still caused avoidable timeouts
-AGENT_STREAM_TIMEOUT = 240  # web-search agent calls: non-streaming requests hit a hard 524 at 100s server-side, so we always stream; this is just the client-side read timeout
-MAX_TOKENS          = 8000  # answer calls — default; reasoning models need this much just to clear their thinking budget (see Step 3 slider help). User can raise up to 16000 in the UI
-QUESTION_MAX_TOKENS = 16000 # question generation: reasoning model uses token budget for internal thinking too
+REQUEST_TIMEOUT     = 180   # passthrough calls (analysis): large batches regularly take 60s+; 120s still caused avoidable timeouts
+AGENT_STREAM_TIMEOUT = 240  # agent calls: non-streaming requests hit a hard 524 at 100s server-side, so we always stream; this is just the client-side read timeout
+MAX_TOKENS          = 8000  # passthrough default; reasoning models need this much just to clear their thinking budget
+QUESTION_MAX_TOKENS = 16000 # question generation: logged only — the Agent API takes no max_tokens
 
-# Phase 2 (analysis) always runs on one strong model in a single call — regardless of
-# which model collected the answers — so the brand/sentiment judgement is consistent
-# across runs and doesn't inherit weaker models' extraction errors.
-ANALYSIS_MODEL              = "claude-opus-4-8"
+# Phase 2 (analysis) always runs on one strong model — regardless of which models
+# collected the answers — so the brand/sentiment judgement is consistent across runs
+# and doesn't inherit weaker models' extraction errors. Which model that is gets
+# resolved per run as the newest Claude Opus the Anthropic endpoint currently lists
+# (resolve_analysis_model). The fallback is only used when that list can't be read.
+ANALYSIS_MODEL_FALLBACK     = "claude-opus-4-8"
 DATASET_ANALYSIS_MAX_TOKENS = 16000  # per-batch analysis output cap; batching keeps the array from being truncated
 ANALYSIS_ANSWER_CHARS       = 2000   # per-answer truncation in the analysis prompt — bounds total input tokens
 
@@ -171,7 +217,7 @@ QUESTION_TEMPERATURE   = 0.8
 ANALYSIS_TEMPERATURE   = 0.0
 
 # Some newer models reject `temperature` ("`temperature` is deprecated for this
-# model", HTTP 400) — claude-opus-4-8, the analysis model, among them. Which ones
+# model", HTTP 400) — claude-opus-4-8 among them. Which ones
 # is learned at runtime from the first such 400 and remembered here, so the retry
 # happens once per model instead of once per call.
 _TEMPERATURE_UNSUPPORTED: set[str] = set()
@@ -317,21 +363,12 @@ ANALYSIS_BATCH_MAX_INPUT_TOKENS = 40000
 ANALYSIS_ANSWER_HEAD_FRAC = 0.7
 
 # Display bucket for models that match none of the known provider prefixes.
-_OTHER_PROVIDER = "Sonstige / Other"   # not tr(): also used as a cached dict key
-
-# Provider order for the passthrough picker, so its default (first entry) is stable
-# across probes. Purely a display ordering — the groups themselves are filled from
-# whatever the live probes return.
-_PROVIDER_ORDER = ("OpenAI", "Anthropic", "Google", "Mistral", "Meta", _OTHER_PROVIDER)
-
-# Selectbox sentinel for the free-text escape hatch. Not a model ID, and chosen so it
-# cannot collide with one.
-_CUSTOM_MODEL_OPTION = "__custom__"
+_OTHER_PROVIDER = "Sonstige / Other"
 
 # Endpoint routing for the PASSTHROUGH path only. These prefixes describe the plain
 # IDs the passthrough endpoints publish (see the catalog notes below) — they are not
 # valid for Agent-API IDs, which carry vendor/region decoration and must never reach
-# this path at all. call_langdock() only consults them once web_search has already
+# this path at all. call_langdock() only consults them once `agent` has already
 # routed the Agent case away.
 def _is_anthropic_model(model: str) -> bool:
     return model.startswith("claude-")
@@ -347,11 +384,14 @@ def _is_google_model(model: str) -> bool:
 # claimed they were disjoint, which is wrong. Measured 18.08.2026 with single
 # max_tokens=1 probe calls:
 #
-#   • Agent Completions API (web search on) → GET /agent/v1/models. IDs are
-#     deployment names and may carry vendor/region decoration
-#     ("eu.anthropic.claude-opus-4-7", "gpt-5-mini-eu", "claude-opus-5@default").
-#   • Provider passthrough (web search off) → one endpoint per provider, no catalog
-#     endpoint. Each names its accepted IDs in the 400 body
+#   • Agent Completions API → GET /agent/v1/models. Every collection call and the
+#     question generation go through here, with web search switched on or off via
+#     capabilities.webSearch — so the Step 1 model pick stays valid whatever is
+#     chosen for web search in Step 3. IDs are deployment names and may carry
+#     vendor/region decoration ("eu.anthropic.claude-opus-4-7", "gpt-5-mini-eu",
+#     "claude-opus-5@default").
+#   • Provider passthrough → one endpoint per provider, no catalog endpoint. Only the
+#     analysis uses it (Anthropic). Each names its accepted IDs in the 400 body
 #     ("Invalid model, available models are: a, b, c"), which is what
 #     _parse_available_models / _probe_models below read.
 #
@@ -359,8 +399,8 @@ def _is_google_model(model: str) -> bool:
 #   1. Each passthrough endpoint knows ONLY its own provider's models. Probing
 #      /openai/…  returns gpt-*/o3/o4-mini/llama and no claude at all; /anthropic/…
 #      returns claude-* only; /google/… returns gemini-* only. So the passthrough
-#      catalog needs one probe PER endpoint, merged — probing just one leaves the
-#      picker missing whole providers (see list_completion_models()).
+#      catalog needs one probe PER endpoint — the analysis model lookup therefore
+#      probes /anthropic/… specifically (see resolve_analysis_model()).
 #   2. An "@default" suffix is accepted by the passthrough and normalized away
 #      server-side: "claude-opus-5@default" → 200, response echoes
 #      "model":"claude-opus-5". So that spelling is NOT a wrong-catalog marker.
@@ -371,7 +411,8 @@ def _is_google_model(model: str) -> bool:
 #
 # The overlap is not a licence to move an ID between catalogs. Each ID is sent
 # verbatim to the endpoint of the catalog it came from — routing follows provenance
-# (did the user pick with web search on or off?), never string inspection of the ID.
+# (Step 1 picker → Agent API, resolved analysis model → Anthropic passthrough), never
+# string inspection of the ID.
 #
 # ---------------------------------------------------------------------------
 # THE AGENT CATALOG IS NOT CONSISTENT BETWEEN REQUESTS (established 18.08.2026 from
@@ -593,28 +634,16 @@ def catalog_equivalent(model_id: str, ids: list[str]) -> str | None:
     return None
 
 
-def render_passthrough_probe_notice(failed: list[str]) -> None:
+def render_agent_model_multiselect(api_key: str, key_prefix: str = "s1") -> tuple[list[str], list[dict]]:
     """
-    Names the passthrough endpoints whose probe returned nothing. There is no stored
-    fallback list any more, so a failed probe means that provider's models are simply
-    absent from the picker and have to be typed in by hand.
-    """
-    if not failed:
-        return
-    names = ", ".join(failed)
-    st.caption("⚠️ " + tr(
-        f"Modell-Liste für {names} nicht abrufbar — diese Anbieter fehlen in der Auswahl. "
-        "IDs können unten manuell eingegeben werden.",
-        f"Could not load the model list for {names} — those providers are missing from the "
-        "picker. Their IDs can be entered manually below.",
-    ))
+    Model picker for Step 1. The options come from a live GET /agent/v1/models and
+    the returned values are `data[].id` verbatim — no rewriting, no stored catalog,
+    reload button next to it. Returns (selected ids, full catalog) — the catalog is
+    handed back so callers can check per-model properties (e.g.
+    supportsExtendedThinking) without re-fetching.
 
-
-def render_agent_model_picker(api_key: str, current_model: str = "", key_prefix: str = "s1") -> str:
-    """
-    Model picker for the web-search (Agent API) path. The options come from a live
-    GET /agent/v1/models and the returned value is `data[].id` verbatim — no
-    rewriting, no stored catalog, reload button next to it.
+    The selection lives in st.session_state.w_models (see _WIDGET_DEFAULTS), so it
+    survives navigating to later steps and back.
     """
     rejected = invalid_model_id()
     if rejected:
@@ -636,102 +665,8 @@ def render_agent_model_picker(api_key: str, current_model: str = "", key_prefix:
     with col_pick:
         if not api_key:
             st.info(tr(
-                "API-Key eingeben, um die für die Websuche verfügbaren Modelle zu laden.",
-                "Enter an API key to load the models available for web search.",
-            ))
-            return ""
-
-        models, err = fetch_agent_models(api_key)
-        if err:
-            st.warning(tr(
-                f"Modell-Liste (GET /agent/v1/models) konnte nicht geladen werden: {err}",
-                f"Could not load the model list (GET /agent/v1/models): {err}",
-            ))
-        if not models:
-            if rejected:
-                st.warning(tr(
-                    f"Modell '{rejected}' wurde von der Agent-API abgelehnt; der Katalog konnte "
-                    "zum Abgleich nicht geladen werden.",
-                    f"Model '{rejected}' was rejected by the Agent API, and the catalog could not "
-                    "be loaded to check against.",
-                ))
-            return st.text_input(
-                tr("Modell-ID (Agent-API, manuell)", "Model ID (Agent API, manual)"),
-                value=current_model,
-                placeholder="z.B. claude-opus-4-6-v1",
-            )
-
-        ids    = [m["id"] for m in models]
-        labels = {m["id"]: agent_model_label(m) for m in models}
-        if current_model:
-            # Re-point the selection at the catalog's current spelling. Only a model
-            # the catalog no longer knows under ANY spelling is a real removal worth
-            # interrupting the user for.
-            equivalent = catalog_equivalent(current_model, ids)
-            if equivalent is None:
-                st.warning(tr(
-                    f"Bisherige Auswahl '{current_model}' ist nicht mehr im Katalog — bitte neu auswählen.",
-                    f"Previous selection '{current_model}' is no longer in the catalog — please pick again.",
-                ))
-                current_model = ""
-            else:
-                current_model = equivalent
-        if rejected and catalog_equivalent(rejected, ids) is None:
-            st.warning(tr(
-                f"Modell '{rejected}' wurde von der Agent-API abgelehnt und steht nicht mehr im Katalog. "
-                "Liste neu geladen — bitte neu auswählen.",
-                f"Model '{rejected}' was rejected by the Agent API and is no longer in the catalog. "
-                "List reloaded — please pick again.",
-            ))
-        model  = st.selectbox(
-            tr("Modell (Agent-API)", "Model (Agent API)"),
-            options=ids,
-            index=ids.index(current_model) if current_model in ids else 0,
-            format_func=lambda i: labels.get(i, i),
-            help=tr(
-                "Live aus GET /agent/v1/models — genau die Modelle, die dein Workspace über die "
-                "Agent-API nutzen kann. Die ID wird unverändert gesendet; Deployment-IDs ändern "
-                "sich, daher keine feste Liste im Code.",
-                "Live from GET /agent/v1/models — exactly the models your workspace can use via the "
-                "Agent API. The ID is sent unchanged; deployment IDs change, so nothing is hardcoded.",
-            ),
-        )
-
-    st.caption(tr(
-        f"{len(ids)} Modelle live geladen · gesendet wird exakt `{model}`",
-        f"{len(ids)} models loaded live · sends exactly `{model}`",
-    ))
-    return model
-
-
-def render_agent_model_multiselect(
-    api_key: str, current_models: list[str], key_prefix: str = "s3",
-) -> tuple[list[str], list[dict]]:
-    """
-    Same as render_agent_model_picker, but for running several models in one go.
-    Returns (selected ids, full catalog) — the catalog is handed back so callers can
-    check per-model properties (e.g. supportsExtendedThinking) without re-fetching.
-    """
-    rejected = invalid_model_id()
-    if rejected:
-        # See render_agent_model_picker: reload now, decide below against the fresh
-        # catalog whether this is a real removal or just a spelling flip.
-        reload_agent_models()
-        clear_invalid_model()
-
-    col_pick, col_reload = st.columns([6, 1])
-    with col_reload:
-        st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
-        if st.button("🔄", key=f"{key_prefix}_reload_models",
-                     help=tr("Modell-Liste neu laden", "Reload model list")):
-            reload_agent_models()
-            st.rerun()
-
-    with col_pick:
-        if not api_key:
-            st.info(tr(
-                "API-Key eingeben, um die für die Websuche verfügbaren Modelle zu laden.",
-                "Enter an API key to load the models available for web search.",
+                "API-Key eingeben, um die verfügbaren Modelle zu laden.",
+                "Enter an API key to load the available models.",
             ))
             return [], []
 
@@ -751,7 +686,7 @@ def render_agent_model_multiselect(
                 ))
             manual = st.text_input(
                 tr("Modell-IDs (Agent-API, kommagetrennt)", "Model IDs (Agent API, comma-separated)"),
-                value=", ".join(current_models),
+                key="w_models_manual",
                 placeholder="z.B. claude-opus-4-6-v1, gpt-5.6-sol",
             )
             return [m.strip() for m in manual.split(",") if m.strip()], []
@@ -759,8 +694,9 @@ def render_agent_model_multiselect(
         ids     = [m["id"] for m in catalog]
         labels  = {m["id"]: agent_model_label(m) for m in catalog}
         # Re-point each remembered selection at the catalog's current spelling; only
-        # the ones with no equivalent at all were really dropped.
-        remapped = [(m, catalog_equivalent(m, ids)) for m in current_models]
+        # the ones with no equivalent at all were really dropped. This has to happen
+        # before the widget is created: a stored value outside `options` would raise.
+        remapped = [(m, catalog_equivalent(m, ids)) for m in st.session_state.w_models]
         dropped  = [m for m, eq in remapped if eq is None]
         if dropped:
             st.warning(tr(
@@ -774,17 +710,22 @@ def render_agent_model_multiselect(
                 f"Model '{rejected}' was rejected by the Agent API and is no longer in the catalog. "
                 "List reloaded — please pick again.",
             ))
-        default = list(dict.fromkeys(eq for _, eq in remapped if eq)) or ids[:1]
+        st.session_state.w_models = list(dict.fromkeys(eq for _, eq in remapped if eq))
         selected = st.multiselect(
-            tr("Modelle (Agent-API)", "Models (Agent API)"),
+            tr("Modelle", "Models"),
             options=ids,
-            default=default,
+            key="w_models",
             format_func=lambda i: labels.get(i, i),
+            placeholder=tr("Ein oder mehrere Modelle wählen", "Pick one or more models"),
             help=tr(
-                "Mehrere Modelle = jede Frage wird mit jedem Modell gesammelt. Das vervielfacht "
-                "die Call-Anzahl, macht die Modelle aber direkt vergleichbar.",
-                "Several models = every question is collected with every model. That multiplies the "
-                "number of calls but makes the models directly comparable.",
+                "Live aus GET /agent/v1/models — genau die Modelle, die dein Workspace nutzen kann. "
+                "Mehrere Modelle = jede Frage wird mit jedem Modell gesammelt; das vervielfacht die "
+                "Call-Anzahl, macht die Modelle aber direkt vergleichbar. Das zuerst ausgewählte "
+                "Modell generiert in Schritt 2 die Fragen.",
+                "Live from GET /agent/v1/models — exactly the models your workspace can use. "
+                "Several models = every question is collected with every model; that multiplies the "
+                "number of calls but makes the models directly comparable. The first selected model "
+                "generates the questions in Step 2.",
             ),
         )
 
@@ -795,62 +736,48 @@ def render_agent_model_multiselect(
     return selected, catalog
 
 
-# One probe per passthrough endpoint. Each endpoint only knows its own provider's
-# models (see the catalog notes above), so a single probe would silently drop whole
-# providers from the picker. The sentinel model ID is what makes each endpoint answer
-# with its accepted list; no real model ID appears here.
-def _passthrough_probe_targets() -> dict[str, tuple[str, dict]]:
-    ping = [{"role": "user", "content": "ping"}]
-    return {
-        "OpenAI": (
-            LANGDOCK_URL,
-            {"model": _PROBE_MODEL_ID, "messages": ping, "max_completion_tokens": 1},
-        ),
-        "Anthropic": (
-            ANTHROPIC_URL,
-            {"model": _PROBE_MODEL_ID, "messages": ping, "max_tokens": 1},
-        ),
-        "Google": (
-            GOOGLE_URL_TEMPLATE.format(model=_PROBE_MODEL_ID),
-            {"contents": [{"role": "user", "parts": [{"text": "ping"}]}],
-             "generationConfig": {"maxOutputTokens": 1}},
-        ),
-    }
+# ---------------------------------------------------------------------------
+# Analysis model — newest Claude Opus, resolved live
+#
+# The analysis runs on the Anthropic passthrough endpoint (it needs max_tokens and
+# temperature, which the Agent API doesn't take), so the candidates come from THAT
+# endpoint's own list, read with the same sentinel probe as the other passthrough
+# catalogs. The chosen ID is a verbatim entry of that list; normalization only ranks
+# the entries, it never produces the string that gets sent.
+# ---------------------------------------------------------------------------
+_OPUS_VERSION_RE = re.compile(r"^claude-opus-(\d+)(?:-(\d{1,2}))?$")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def list_completion_models(api_key: str) -> tuple[dict[str, list[str]], list[str]]:
+def resolve_analysis_model(api_key: str) -> tuple[str, bool]:
     """
-    Live model catalog for the provider-passthrough endpoints (web search off).
+    Returns (model_id, from_catalog). from_catalog is False when the Anthropic list
+    couldn't be read or held no Opus model, in which case ANALYSIS_MODEL_FALLBACK is
+    returned.
 
-    Returns (grouped_by_provider, failed_endpoints). Every ID comes from a live probe
-    of the endpoint that serves it — there is no stored fallback list, so an endpoint
-    that cannot be probed is simply absent and is named in `failed_endpoints` for the
-    UI to report. Endpoint names, not translated strings: the result is cached and
-    must not freeze the language it was first fetched in.
+    Ranking: highest (major, minor) version; among spellings of the same version the
+    shortest ID wins, so the plain alias beats a dated or @-suffixed deployment.
     """
     if not api_key:
-        return {}, []
-
-    ids: list[str] = []
-    failed: list[str] = []
-    for endpoint, (url, payload) in _passthrough_probe_targets().items():
-        found = _probe_models(url, api_key, payload)
-        if found:
-            ids.extend(found)
-        else:
-            failed.append(endpoint)
-
-    # Bucket by what the ID actually is rather than by which endpoint answered: the
-    # OpenAI-compatible endpoint also serves third-party models (llama), which belong
-    # under their own provider in the picker.
-    grouped: dict[str, list[str]] = {}
-    for mid in sorted(dict.fromkeys(ids)):   # dedupe — endpoints repeat entries
-        grouped.setdefault(_model_provider_label(mid), []).append(mid)
-
-    ordered = {p: grouped[p] for p in _PROVIDER_ORDER if grouped.get(p)}
-    ordered.update({p: m for p, m in grouped.items() if p not in ordered})
-    return ordered, failed
+        return ANALYSIS_MODEL_FALLBACK, False
+    payload = {
+        "model":      _PROBE_MODEL_ID,
+        "messages":   [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }
+    best, best_rank = None, None
+    for mid in _probe_models(ANTHROPIC_URL, api_key, payload):
+        m = _OPUS_VERSION_RE.match(_normalize_model_id(mid))
+        if not m:
+            continue
+        rank = (int(m.group(1)), int(m.group(2) or 0), -len(mid))
+        if best_rank is None or rank > best_rank:
+            best, best_rank = mid, rank
+    if best is None:
+        log.warning("No Claude Opus model in the Anthropic catalog — falling back to %s", ANALYSIS_MODEL_FALLBACK)
+        return ANALYSIS_MODEL_FALLBACK, False
+    log.info("Analysis model resolved to %s (newest Claude Opus in the Anthropic catalog)", best)
+    return best, True
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +796,7 @@ def call_langdock(
     lang: str = "de",
     temperature: float | None = None,
     extended_thinking: bool = False,
+    agent: bool = False,
 ) -> tuple[str | None, str | None, dict]:
     """
     Returns (response_text, error_message, usage).
@@ -879,7 +807,11 @@ def call_langdock(
     function runs inside ThreadPoolExecutor worker threads, where Streamlit's
     session_state is not accessible.
 
-    `temperature` is forwarded on every path, including the web-search one: the Agent
+    `agent` routes to the Agent Completions API. It must be set for every model ID
+    that came from the Step 1 picker (GET /agent/v1/models) — those IDs are only valid
+    there. `web_search` implies it.
+
+    `temperature` is forwarded on every path, including the Agent one: the Agent
     API's inline agent object documents a `temperature` field (0-1). Without it, the
     N runs of the same question on that path varied only through differing search
     results, which weakened the whole point of running a question repeatedly.
@@ -889,13 +821,13 @@ def call_langdock(
     if is_model_dead(model):
         return None, _dead_model_error(model, lang), {}
 
-    if web_search:
+    if agent or web_search:
         # Real web search is only available via the model-agnostic Agent Completions
         # API (capabilities.webSearch) — the provider-native endpoints below don't
         # support a built-in search tool. Routed separately since it's a different
         # request/response shape (Vercel AI SDK UIMessage, SSE streaming).
         return call_langdock_agent(
-            api_key, messages, model, lang=lang,
+            api_key, messages, model, lang=lang, web_search=web_search,
             temperature=temperature, extended_thinking=extended_thinking,
         )
 
@@ -1116,26 +1048,29 @@ def call_langdock(
 
 
 # ---------------------------------------------------------------------------
-# Agent Completions API — real web search
+# Agent Completions API — collection and question generation
 # Routes through https://api.langdock.com/agent/v1/chat/completions using a
-# temporary agent with capabilities.webSearch=true. This is the only Langdock
+# temporary agent. With capabilities.webSearch=true this is the only Langdock
 # endpoint that gives every provider's models (OpenAI/Anthropic/Google/...) a
 # real, built-in web search tool via one flag — the provider-native endpoints
-# used by call_langdock() above don't support a built-in search tool.
+# used by call_langdock() above don't support a built-in search tool. With
+# webSearch=false it is simply a model-agnostic completion endpoint, which is why
+# the Step 1 model pick doesn't depend on the web search setting.
 #
 # Uses SSE streaming (Vercel AI SDK "UI Message Stream" protocol): Langdock
 # kills non-streaming Agent API requests with an HTTP 524 after 100s, and
 # web-search calls (search + read results + compose an answer) regularly run
 # longer than that.
 #
-# Token usage is not documented for this endpoint's response, so usage always
-# comes back as zeros for these calls (tokens_in/tokens_out show 0 in the UI).
+# Token usage is not documented for this endpoint's response, so none is reported
+# for these calls. It doesn't accept max_tokens either.
 # ---------------------------------------------------------------------------
 def call_langdock_agent(
     api_key: str,
     messages: list[dict],
     model: str,
     lang: str = "de",
+    web_search: bool = False,
     temperature: float | None = None,
     extended_thinking: bool = False,
 ) -> tuple[str | None, str | None, dict]:
@@ -1153,9 +1088,26 @@ def call_langdock_agent(
     # which is what gates the checkbox in the UI. Enabling it on a model that can't
     # do it returns a 400 — handled below by dropping the flag and retrying, so a
     # stale selection costs one request rather than the whole run.
-    capabilities = {"webSearch": True}
+    capabilities = {"webSearch": web_search}
     if extended_thinking:
         capabilities["extendedThinking"] = True
+
+    if web_search:
+        # capabilities.webSearch only makes the tool available — the model still
+        # decides on its own whether to call it. Without an explicit nudge, models
+        # (especially smaller ones like Haiku) tend to fall back on their trained
+        # "I don't have real-time access" response instead of trying the tool,
+        # particularly for questions they're confident are "in the future".
+        instructions = (
+            "You have a live web search tool with current results. For any question about "
+            "products, brands, providers, rankings, prices, or recommendations, search the web "
+            "first and base your answer on what you find — even if you feel you already know the "
+            "answer, since your training data is outdated. Do not state or imply you lack "
+            "real-time access; you have it. Only skip searching for purely timeless facts "
+            "(definitions, basic concepts)."
+        )
+    else:
+        instructions = "You are a helpful assistant."
 
     # `model` is sent exactly as it came from GET /agent/v1/models — never rewritten.
     ui_messages = [
@@ -1168,20 +1120,8 @@ def call_langdock_agent(
     ]
     payload = {
         "agent": {
-            "name": "Brand Visibility Assistant",
-            # capabilities.webSearch only makes the tool available — the model still
-            # decides on its own whether to call it. Without an explicit nudge, models
-            # (especially smaller ones like Haiku) tend to fall back on their trained
-            # "I don't have real-time access" response instead of trying the tool,
-            # particularly for questions they're confident are "in the future".
-            "instructions": (
-                "You have a live web search tool with current results. For any question about "
-                "products, brands, providers, rankings, prices, or recommendations, search the web "
-                "first and base your answer on what you find — even if you feel you already know the "
-                "answer, since your training data is outdated. Do not state or imply you lack "
-                "real-time access; you have it. Only skip searching for purely timeless facts "
-                "(definitions, basic concepts)."
-            ),
+            "name":         "Brand Visibility Assistant",
+            "instructions": instructions,
             "model":        model,
             "capabilities": capabilities,
         },
@@ -1424,29 +1364,35 @@ def call_langdock_agent(
 # Makes a minimal API call to verify credentials and model name.
 # Shown in Step 1 so problems are caught before a long run starts.
 # ---------------------------------------------------------------------------
-def test_connection(api_key: str, model: str, web_search: bool = False) -> tuple[bool, str]:
+def test_connections(api_key: str, models: list[str]) -> dict[str, tuple[bool, str]]:
     """
-    Minimal call to verify credentials and model name.
-    Uses the same payload shape as brand_monitor.py.
-    When `web_search` is set, tests the Agent Completions API path instead —
-    the endpoint actually used once web search is enabled for the run.
+    One minimal Agent-API call per selected model, in parallel, to verify the key and
+    every model ID. Web search stays off here: the endpoint and the ID are what can be
+    wrong, and a search would only make the test slower.
+    Returns {model: (ok, message)} in selection order.
     """
     reset_run_abort()   # this is the user re-checking after fixing something
     reset_dead_models()
-    text, err, _ = call_langdock(
-        api_key,
-        [{"role": "user", "content": "Say 'OK' and nothing else."}],
-        model=model,
-        max_tokens=MAX_TOKENS,  # use same value as main calls, not a small number
-        web_search=web_search,
-        lang=st.session_state.get("lang", "de"),
-    )
-    if text:
-        return True, tr(
-            f"Verbindung erfolgreich. Modell antwortet: '{text.strip()[:80]}'",
-            f"Connection successful. Model responded: '{text.strip()[:80]}'",
+    lang = st.session_state.get("lang", "de")  # captured here — worker threads can't read session_state
+
+    def _one(model: str) -> tuple[bool, str]:
+        text, err, _ = call_langdock(
+            api_key,
+            [{"role": "user", "content": "Say 'OK' and nothing else."}],
+            model=model,
+            agent=True,
+            lang=lang,
         )
-    return False, err or tr("Keine Antwort erhalten.", "No response received.")
+        if text:
+            return True, tr(
+                f"Verbindung erfolgreich. Antwort: '{text.strip()[:80]}'",
+                f"Connection successful. Response: '{text.strip()[:80]}'",
+                lang=lang,
+            )
+        return False, err or tr("Keine Antwort erhalten.", "No response received.", lang=lang)
+
+    with ThreadPoolExecutor(max_workers=min(len(models), 5) or 1) as executor:
+        return dict(zip(models, executor.map(_one, models)))
 
 
 # ---------------------------------------------------------------------------
@@ -1476,7 +1422,7 @@ def _dedupe_questions(questions: list[str]) -> list[str]:
     return out
 
 def generate_questions(
-    api_key: str, topic: str, n: int, model: str, web_search: bool = False,
+    api_key: str, topic: str, n: int, model: str,
 ) -> tuple[list[str], str | None]:
     lang = st.session_state.get("lang", "de")
     reset_run_abort()   # new user-initiated action — don't inherit an earlier run's abort
@@ -1510,16 +1456,16 @@ def generate_questions(
         max_tokens=QUESTION_MAX_TOKENS,  # reasoning models consume the budget for internal thinking + output
         lang=lang,
         temperature=QUESTION_TEMPERATURE,
-        # Must match the picker the `model` came from: with web search on it is an
-        # Agent-API deployment ID, which only the Agent endpoint accepts. Defaulting
-        # this to False sent those IDs to a provider passthrough, where the
-        # vendor/region-prefixed ones ("eu.anthropic.…") 400 as unavailable.
-        web_search=web_search,
+        # `model` is an Agent-API deployment ID from the Step 1 picker, which only the
+        # Agent endpoint accepts — on a provider passthrough the vendor/region-prefixed
+        # ones ("eu.anthropic.…") 400 as unavailable. No web search: the web search
+        # option is only chosen in Step 3, and generating questions doesn't need it.
+        agent=True,
     )
     # The Agent-path logger records neither the caller nor the token budget (unlike the
     # passthrough one), so without this line a question-generation call is
     # indistinguishable from any other agent call in the log.
-    endpoint = "agent" if web_search else "passthrough"
+    endpoint = "agent"
     if not text:
         log.warning(
             "generate_questions FAILED — model=%s | endpoint=%s | max_tokens=%d | requested=%d | %s",
@@ -1562,7 +1508,7 @@ def generate_questions(
     )
     if len(questions) < n:
         # Fewer than requested after dedupe — usually near-duplicates were collapsed.
-        # Not an error: Step 2 shows the real count and lets the user add more.
+        # Not an error: the Step 2 text area shows the real count and lets the user add more.
         log.info("generate_questions: requested %d, got %d after cleaning/dedupe", n, len(questions))
     return questions, None
 
@@ -1574,15 +1520,13 @@ def generate_questions(
 # ---------------------------------------------------------------------------
 def ask_question(
     api_key: str, question: str, model: str, lang: str,
-    web_search: bool = False, max_tokens: int = MAX_TOKENS,
-    short_answer: bool = False, extended_thinking: bool = False,
-    market: str = "",
+    web_search: bool = True, short_answer: bool = False, extended_thinking: bool = False,
 ) -> tuple[str | None, str | None, dict]:
     # `lang` is passed in explicitly (captured on the main thread before submitting
     # to ThreadPoolExecutor) — st.session_state is not accessible from worker threads.
     # No "use current knowledge" prompt hint needed here — when web_search is True,
-    # call_langdock() routes this to the Agent API, which gives the model a real
-    # web search tool instead of just asking it to pretend it has fresh knowledge.
+    # the Agent API gives the model a real web search tool instead of just asking it
+    # to pretend it has fresh knowledge.
     if lang == "de":
         if short_answer:
             content = (
@@ -1613,38 +1557,18 @@ def ask_question(
                 "Answer the following question factually and in detail.\n\n"
                 f"Question: {question}"
             )
-    if market.strip():
-        # Langdock's API has no location/region parameter (checked against the agent
-        # schema, the capabilities list and the changelog), so the market is steered
-        # through the prompt. That is a real lever for this use case: brand
-        # recommendations and the sources a search picks differ heavily by market.
-        content = _with_market_context(content, market.strip(), lang)
 
     return call_langdock(
         api_key,
         [{"role": "user", "content": content}],
         model=model,
-        max_tokens=max_tokens,
+        agent=True,          # Step 1 picker IDs are Agent-API IDs, with or without web search
         web_search=web_search,
         lang=lang,
         # Non-zero so repeated runs of the same question vary — otherwise the
         # multiple-runs statistic is meaningless.
         temperature=COLLECTION_TEMPERATURE,
         extended_thinking=extended_thinking,
-    )
-
-
-def _with_market_context(content: str, market: str, lang: str) -> str:
-    if lang == "de":
-        return (
-            f"Kontext: Beantworte die Frage aus Sicht des Marktes „{market}“. "
-            f"Berücksichtige Anbieter, Marken und Angebote, die dort tatsächlich verfügbar sind, "
-            f"und stütze dich bevorzugt auf Quellen aus diesem Markt.\n\n{content}"
-        )
-    return (
-        f"Context: answer from the perspective of the \"{market}\" market. "
-        f"Consider providers, brands and offers actually available there, and prefer "
-        f"sources from that market.\n\n{content}"
     )
 
 
@@ -1782,7 +1706,7 @@ def _parse_json_object(text: str) -> dict:
 # ---------------------------------------------------------------------------
 # Whole-dataset brand analysis. The collected dataset is split into batches
 # (see _make_analysis_batches) and each batch is sent to a single strong model
-# (ANALYSIS_MODEL). Batching keeps a large run's output JSON from being silently
+# (resolve_analysis_model). Batching keeps a large run's output JSON from being silently
 # truncated — a single mega-call that hits finish_reason=max_tokens produces
 # unparseable JSON and loses ALL analysis, whereas a bad batch loses only itself.
 # Each answer in a batch is numbered locally; the model returns a flat array whose
@@ -1914,7 +1838,7 @@ _MENTION_FIELDS = ("brand", "sentiment", "confidence", "reason", "aspect", "exce
 
 
 def _analyze_batch(
-    api_key: str, batch: list[dict], brands: list[str], lang: str,
+    api_key: str, batch: list[dict], brands: list[str], lang: str, model: str,
 ) -> tuple[list[dict], str, dict, str | None]:
     """Runs one batch. Returns (mentions, summary, usage, error). Mentions keep the
     batch-local "index" as returned by the model — the caller offsets it."""
@@ -1922,7 +1846,7 @@ def _analyze_batch(
     text, err, usage = call_langdock(
         api_key,
         [{"role": "user", "content": prompt}],
-        model=ANALYSIS_MODEL,
+        model=model,
         max_tokens=DATASET_ANALYSIS_MAX_TOKENS,
         lang=lang,
         temperature=ANALYSIS_TEMPERATURE,
@@ -1953,7 +1877,7 @@ def _analyze_batch(
 
 
 def _summarize_dataset(
-    api_key: str, by_index: dict[int, list[dict]], n_answers: int, lang: str,
+    api_key: str, by_index: dict[int, list[dict]], n_answers: int, lang: str, model: str,
 ) -> tuple[str, dict, str | None]:
     """Produces one executive summary from aggregated stats. Used only when the dataset
     spans multiple batches (each batch's own summary would see only part of the data)."""
@@ -1989,7 +1913,7 @@ def _summarize_dataset(
     text, err, usage = call_langdock(
         api_key,
         [{"role": "user", "content": prompt}],
-        model=ANALYSIS_MODEL,
+        model=model,
         max_tokens=1000,
         lang=lang,
         temperature=ANALYSIS_TEMPERATURE,
@@ -2002,8 +1926,10 @@ def analyze_dataset(
     answers: list[dict],
     brands: list[str],
     lang: str,
+    model: str,
 ) -> tuple[dict[int, list[dict]], str, dict, str | None]:
     """
+    Runs on `model` (the resolved analysis model, see resolve_analysis_model).
     Returns (by_index, summary, usage, error).
       by_index: {answer_index: [ {brand, sentiment, confidence, reason, aspect, excerpt, rank}, ... ]}
       summary:  a short executive-summary paragraph
@@ -2024,7 +1950,7 @@ def analyze_dataset(
             # full retry cycle to fail the same way. Keep what was analyzed.
             errors.append(_abort_error(lang))
             break
-        flat, b_summary, usage, err = _analyze_batch(api_key, batch, brands, lang)
+        flat, b_summary, usage, err = _analyze_batch(api_key, batch, brands, lang, model)
         for k in total_usage:
             total_usage[k] += usage.get(k, 0)
         if err:
@@ -2052,7 +1978,7 @@ def analyze_dataset(
     if len(batches) <= 1:
         summary = batch_summaries[0] if batch_summaries else ""
     else:
-        summary, s_usage, _ = _summarize_dataset(api_key, by_index, len(answers), lang)
+        summary, s_usage, _ = _summarize_dataset(api_key, by_index, len(answers), lang, model)
         for k in total_usage:
             total_usage[k] += s_usage.get(k, 0)
         if not summary and batch_summaries:
@@ -2170,8 +2096,6 @@ def build_raw_export(raw_answers: list[dict], brands: list[str]) -> pd.DataFrame
             "n_sources":           len(sources),
             "web_search_used":     r.get("web_search_used", False),
             "citation_count":      r.get("citation_count", 0),
-            "tokens_in":           r.get("tokens_in", 0),
-            "tokens_out":          r.get("tokens_out", 0),
             "answer":              r.get("answer", ""),
         })
     return pd.DataFrame(rows)
@@ -2226,57 +2150,57 @@ def save_csv(results: list[dict], model: str, brands: list[str] | None = None, f
 # ---------------------------------------------------------------------------
 _TUTORIALS = {
     1: (
-        "❓ Anleitung — Schritt 1: Einrichtung",
-        "❓ Tutorial — Step 1: Setup",
+        "❓ Anleitung — Schritt 1: Verbindung & Modelle",
+        "❓ Tutorial — Step 1: Connection & models",
         """
 1. **API-Key** eingeben (Langdock).
-2. **Websuche** ist standardmäßig aktiv — die Modelle antworten dann mit echter Web-Recherche.
-3. **Modell** wählen, mit dem die Antworten gesammelt werden.
-4. **Fragen-Modus** wählen: automatisch generieren (dann Thema + Anzahl angeben) oder eigene Fragen eintippen.
-5. **Brand-Erkennung**: eigene Marken vorgeben oder automatisch aus den Antworten extrahieren lassen.
-6. Optional **Verbindung testen**, dann weiter.
+2. Ein oder mehrere **Modelle** wählen — die Liste kommt live aus deinem Workspace. Mehrere Modelle = jede Frage wird mit jedem Modell gestellt.
+3. **Verbindung testen** — ein Mini-Call pro Modell, zeigt Probleme vor dem langen Lauf.
+4. Weiter zu den Fragen. Alle Eingaben bleiben erhalten, wenn du später hierher zurückkommst.
 """,
         """
 1. Enter your **API key** (Langdock).
-2. **Web search** is on by default — models then answer with real web research.
-3. Pick the **model** used to collect the answers.
-4. Choose a **question mode**: auto-generate (then give a topic + count) or type your own questions.
-5. **Brand detection**: specify your own brands, or let them be extracted automatically from the answers.
-6. Optionally **test the connection**, then continue.
+2. Pick one or more **models** — the list is loaded live from your workspace. Several models = every question is asked with every model.
+3. **Test the connection** — one tiny call per model, surfaces problems before the long run.
+4. Continue to the questions. Everything you enter is kept when you come back here later.
 """,
     ),
     2: (
-        "❓ Anleitung — Schritt 2: Fragen prüfen",
-        "❓ Tutorial — Step 2: Review questions",
+        "❓ Anleitung — Schritt 2: Fragen & Brands",
+        "❓ Tutorial — Step 2: Questions & brands",
         """
-Jede Zeile ist eine Frage. Bearbeite, lösche oder ergänze sie frei — nur diese Fragen werden anschließend an das Modell gestellt.
+1. **Fragen**: automatisch zu einem Thema generieren (das übernimmt das zuerst ausgewählte Modell) oder eigene eintippen. Das Textfeld ist frei editierbar — eine Frage pro Zeile, nur diese Fragen werden gestellt.
+2. **Brand-Erkennung**: eigene Marken vorgeben oder alle Marken automatisch aus den Antworten erkennen lassen.
 """,
         """
-Each line is one question. Edit, delete, or add freely — only these questions will be sent to the model.
+1. **Questions**: auto-generate them for a topic (done by the first selected model) or type your own. The text area is freely editable — one question per line, only these questions are asked.
+2. **Brand detection**: specify your own brands, or let all brands be detected automatically from the answers.
 """,
     ),
     3: (
-        "❓ Anleitung — Schritt 3: Runs konfigurieren",
-        "❓ Tutorial — Step 3: Configure runs",
+        "❓ Anleitung — Schritt 3: Übersicht & Optionen",
+        "❓ Tutorial — Step 3: Overview & options",
         """
-- **Runs pro Frage**: wie oft jede Frage wiederholt wird (mehr Runs = stabilere Statistik).
-- **Parallele Calls**: die Voreinstellung bleibt sicher unter dem Rate-Limit.
-- Danach werden die **Rohdaten** gesammelt; die Marken-/Sentiment-Analyse folgt erst im nächsten Schritt.
+- **Übersicht**: alle Einstellungen aus Schritt 1 und 2. „Bearbeiten“ springt zurück — nichts geht verloren.
+- **Websuche** ist standardmäßig an; **Extended Thinking** nur für Modelle, die es unterstützen.
+- **Runs pro Frage**: wie oft jede Frage wiederholt wird (mehr Runs = stabilere Statistik). **Parallele Calls**: die Voreinstellung bleibt sicher unter dem Rate-Limit.
+- **Daten sammeln** holt die **Rohdaten**; die Marken-/Sentiment-Analyse folgt erst im nächsten Schritt.
 """,
         """
-- **Runs per question**: how often each question is repeated (more runs = more stable statistics).
-- **Parallel calls**: the default stays safely under the rate limit.
-- This collects the **raw data**; the brand/sentiment analysis only happens in the next step.
+- **Overview**: all settings from Steps 1 and 2. "Edit" jumps back — nothing is lost.
+- **Web search** is on by default; **extended thinking** only for models that support it.
+- **Runs per question**: how often each question is repeated (more runs = more stable statistics). **Parallel calls**: the default stays safely under the rate limit.
+- **Collect data** gathers the **raw data**; the brand/sentiment analysis only happens in the next step.
 """,
     ),
     4: (
         "❓ Anleitung — Schritt 4: Rohdaten",
         "❓ Tutorial — Step 4: Raw data",
         """
-Prüfe und exportiere die gesammelten Antworten. Du kannst dann die **Analyse starten** (ein Durchlauf mit Claude Opus 4.8), **Einstellungen ändern** (z.B. anderes Modell, gleiche Fragen) oder **neu beginnen**.
+Prüfe und exportiere die gesammelten Antworten. Du kannst dann die **Analyse starten** (mit dem neuesten Claude Opus aus deinem Workspace), **Einstellungen ändern** (z.B. anderes Modell, gleiche Fragen) oder **neu beginnen**.
 """,
         """
-Inspect and export the collected answers. You can then **start the analysis** (a single pass with Claude Opus 4.8), **change settings** (e.g. a different model, same questions), or **start over**.
+Inspect and export the collected answers. You can then **start the analysis** (with the newest Claude Opus in your workspace), **change settings** (e.g. a different model, same questions), or **start over**.
 """,
     ),
     5: (
@@ -2300,103 +2224,171 @@ def render_tutorial(step: int):
         st.markdown(tr(body_de, body_en))
 
 
+_STEP_TITLES = {
+    1: ("Verbindung & Modelle", "Connection & models"),
+    2: ("Fragen & Brands", "Questions & brands"),
+    3: ("Übersicht & Optionen", "Overview & options"),
+    4: ("Rohdaten prüfen", "Review raw data"),
+}
+
+
+def render_step_header(step: int):
+    st.title("📊 LLM Brand Visibility")
+    if step == 1:
+        st.caption(tr(
+            "Messe, wie LLMs Marken in beliebigen Themen wahrnehmen und empfehlen.",
+            "Measure how LLMs perceive and recommend brands across any topic.",
+        ))
+    title_de, title_en = _STEP_TITLES[step]
+    st.progress(step / 4, tr(f"Schritt {step} von 4 — {title_de}", f"Step {step} of 4 — {title_en}"))
+    render_tutorial(step)
+    st.divider()
+
+
+def _parse_questions(text: str) -> list[str]:
+    return [q.strip() for q in (text or "").splitlines() if q.strip()]
+
+
+def _parse_brands(text: str) -> list[str]:
+    return [b.strip() for b in (text or "").split(",") if b.strip()]
+
+
+def _go_to(step: int):
+    st.session_state.step = step
+    st.rerun()
+
+
 # ===========================================================================
-# UI — Step 1: Setup
-# Collects all configuration and allows testing the connection before running.
+# UI — Step 1: Connection & models
+# API key, one or more models, connection test.
 # ===========================================================================
 def render_step1():
-    st.title("📊 LLM Brand Visibility")
-    st.caption(tr(
-        "Messe, wie LLMs Marken in beliebigen Themen wahrnehmen und empfehlen.",
-        "Measure how LLMs perceive and recommend brands across any topic.",
-    ))
-    render_tutorial(1)
-    st.divider()
+    render_step_header(1)
 
     col_form, col_info = st.columns([3, 2])
 
     with col_form:
-        st.subheader(tr("Konfiguration", "Configuration"))
+        st.subheader(tr("Verbindung", "Connection"))
 
         api_key = st.text_input(
             "Langdock API Key",
             type="password",
+            key="w_api_key",
             placeholder="sk--...",
             help=tr("Wird nicht gespeichert. Nur für diese Session.", "Not stored. Only used for this session."),
         )
 
-        web_search = st.checkbox(
-            tr("Websuche aktivieren", "Enable web search"),
-            value=True,
-            help=tr(
-                "Echte Websuche über die Langdock Agent-API (funktioniert mit jedem Modell). "
-                "Läuft über einen separaten Endpunkt ohne Token-Reporting und kann pro Call länger dauern. "
-                "Die Modell-Liste unten wechselt dann auf den Agent-API-Katalog (andere Modell-IDs).",
-                "Real web search via the Langdock Agent API (works with any model). "
-                "Runs through a separate endpoint with no token reporting, and can take longer per call. "
-                "The model list below switches to the Agent API's catalog (different model IDs) when enabled.",
-            ),
-        )
+        st.markdown(f"**{tr('Modelle', 'Models')}**")
+        models, _ = render_agent_model_multiselect(api_key, key_prefix="s1")
+        st.session_state.selected_models = models
 
-        custom_label = tr("Benutzerdefiniert...", "Custom...")
-        if web_search:
-            model = render_agent_model_picker(api_key, key_prefix="s1")
-        else:
-            catalog, probe_failed = list_completion_models(api_key)
-            render_passthrough_probe_notice(probe_failed)
-            flat   = [(p, m) for p, ms in catalog.items() for m in ms]
-            ids    = [m for _, m in flat] + [_CUSTOM_MODEL_OPTION]
-            labels = {m: f"{p}  ·  {m}" for p, m in flat}
-            labels[_CUSTOM_MODEL_OPTION] = custom_label
-            if not flat:
-                st.info(tr(
-                    "API-Key eingeben, um die verfügbaren Modelle zu laden.",
-                    "Enter an API key to load the available models.",
-                ) if not api_key else tr(
-                    "Keine Modell-Liste verfügbar — bitte die Modell-ID manuell eingeben.",
-                    "No model list available — please enter the model ID manually.",
+        # Connection test — one minimal call per selected model
+        st.markdown("---")
+        if st.button("🔌 " + tr("Verbindung testen", "Test connection"), disabled=not (api_key and models)):
+            with st.spinner(tr(f"Teste {len(models)} Modell(e)...", f"Testing {len(models)} model(s)...")):
+                st.session_state.conn_test = {
+                    "key":     key_fingerprint(api_key),
+                    "results": test_connections(api_key, models),
+                }
+
+        # Results are kept in session state so they are still visible after coming
+        # back from a later step — but only for the key they were produced with.
+        test = st.session_state.get("conn_test") or {}
+        if api_key and test.get("key") == key_fingerprint(api_key):
+            results = test.get("results", {})
+            tested  = [(m, results[m]) for m in models if m in results]
+            for m, (ok, msg) in tested:
+                if ok:
+                    st.success(f"`{m}` — {msg}")
+                else:
+                    st.error(f"`{m}` — {msg}")
+            untested = [m for m in models if m not in results]
+            if tested and untested:
+                st.caption(tr(
+                    f"Noch nicht getestet: {', '.join(untested)}",
+                    f"Not tested yet: {', '.join(untested)}",
                 ))
-            model_option = st.selectbox(
-                tr("Modell", "Model"),
-                options=ids,
-                index=0,
-                format_func=lambda i: labels.get(i, i),
-                help=tr(
-                    "Live aus deinem Langdock-Workspace geladen (sobald ein API-Key gesetzt ist) — "
-                    "je ein Probe-Call pro Anbieter-Endpunkt. 'Benutzerdefiniert...' für andere IDs.",
-                    "Loaded live from your Langdock workspace (once an API key is set) — one probe "
-                    "call per provider endpoint. 'Custom...' for other IDs.",
-                ),
-            )
-            if model_option == _CUSTOM_MODEL_OPTION:
-                model = st.text_input(
-                    tr("Modell-Name (benutzerdefiniert)", "Model name (custom)"),
-                    placeholder=tr("z.B. gpt-4o-search-preview", "e.g. gpt-4o-search-preview"),
-                )
-            else:
-                model = model_option
+            if any(not res[0] for _, res in tested):
+                st.info(tr(
+                    "Häufige Ursachen:\n"
+                    "- API-Key falsch oder abgelaufen\n"
+                    "- Modell im Workspace nicht (mehr) verfügbar — Liste mit 🔄 neu laden",
+                    "Common causes:\n"
+                    "- API key wrong or expired\n"
+                    "- Model not (or no longer) available in the workspace — reload the list with 🔄",
+                ))
 
-        st.markdown(f"**{tr('Fragen', 'Questions')}**")
-        opt_gen      = tr("Automatisch generieren", "Auto-generate")
-        opt_manual_q = tr("Eigene Fragen eingeben", "Enter your own questions")
+    with col_info:
+        st.subheader(tr("Hinweise", "Notes"))
+        first_model = models[0] if models else "—"
+        st.markdown(tr(
+            f"""
+**Modelle:** Die Liste wird live aus deinem Workspace geladen ([Agent-API-Katalog](https://docs.langdock.com/en/developer/agents-api/agent-models)). Mehrere Modelle = jede Frage wird mit jedem Modell gestellt — die Anzahl der Calls vervielfacht sich entsprechend.
+
+**Fragen-Generierung:** übernimmt in Schritt 2 das zuerst ausgewählte Modell (aktuell `{first_model}`).
+
+**Analyse:** läuft unabhängig von dieser Auswahl immer mit dem neuesten Claude Opus aus deinem Workspace.
+
+**Verbindung testen** bevor du startest — ein Mini-Call pro Modell spart Zeit bei Fehlern.
+            """,
+            f"""
+**Models:** The list is loaded live from your workspace ([Agent API catalog](https://docs.langdock.com/en/developer/agents-api/agent-models)). Several models = every question is asked with every model — the number of calls multiplies accordingly.
+
+**Question generation:** done in Step 2 by the first selected model (currently `{first_model}`).
+
+**Analysis:** always runs with the newest Claude Opus in your workspace, independent of this selection.
+
+**Test the connection** before you start — one tiny call per model saves time on errors.
+            """,
+        ))
+
+    st.divider()
+
+    if st.button(
+        tr("Weiter: Fragen & Brands →", "Next: Questions & brands →"),
+        type="primary",
+        disabled=not (api_key and models),
+    ):
+        _go_to(2)
+
+
+# ===========================================================================
+# UI — Step 2: Questions & brands
+# Generate (first selected model) or type questions; choose brand detection.
+# ===========================================================================
+def render_step2():
+    render_step_header(2)
+
+    api_key = st.session_state.w_api_key
+    models  = st.session_state.selected_models
+    if not (api_key and models):
+        st.warning(tr(
+            "Bitte zuerst in Schritt 1 API-Key und Modelle festlegen.",
+            "Please set the API key and models in Step 1 first.",
+        ))
+        if st.button(tr("← Zurück", "← Back")):
+            _go_to(1)
+        return
+
+    col_q, col_b = st.columns([3, 2])
+
+    with col_q:
+        st.subheader(tr("Fragen", "Questions"))
         question_mode = st.radio(
             tr("Fragen-Modus", "Question mode"),
-            [opt_gen, opt_manual_q],
-            help=tr(
-                "Automatisch: das Modell generiert Fragen zu einem Thema (ein Extra-Call). "
-                "Eigene Fragen: direkt eingeben, kein Thema und kein Generierungs-Call nötig.",
-                "Auto-generate: the model creates questions about a topic (one extra call). "
-                "Your own: enter them directly, no topic and no generation call needed.",
+            ["generate", "manual"],
+            key="w_question_mode",
+            horizontal=True,
+            format_func=lambda o: (
+                tr("Automatisch generieren", "Auto-generate") if o == "generate"
+                else tr("Eigene Fragen eingeben", "Enter your own questions")
             ),
         )
 
-        # Topic + count are only relevant for auto-generation. In manual mode the user
-        # supplies the questions directly, so we don't ask for a topic at all.
-        topic = ""
-        manual_questions_input = ""
-        if question_mode == opt_gen:
+        if question_mode == "generate":
             topic = st.text_area(
                 tr("Thema / Kontext", "Topic / Context"),
+                key="w_topic",
                 placeholder=tr(
                     "z.B. 'High-Performance Sportwagen im DACH-Markt'\n"
                     "oder 'CRM-Software für mittelständische Unternehmen'",
@@ -2407,252 +2399,156 @@ def render_step1():
             )
             n_questions = st.slider(
                 tr("Anzahl Fragen generieren", "Number of questions to generate"),
-                min_value=5, max_value=200, value=20, step=5,
+                min_value=5, max_value=200, step=5,
+                key="w_n_questions",
             )
-        else:
-            n_questions = 0
-            manual_questions_input = st.text_area(
-                tr("Eigene Fragen (eine pro Zeile)", "Your own questions (one per line)"),
-                height=150,
-                placeholder=tr(
-                    "Was sind die besten CRM-Tools für kleine Unternehmen?\n"
-                    "Welche Anbieter empfiehlst du für Cloud-Hosting?",
-                    "What are the best CRM tools for small businesses?\n"
-                    "Which providers would you recommend for cloud hosting?",
-                ),
+            replaces = bool(st.session_state.w_questions_text.strip())
+            # Handled before the text area below is created: its state may only be
+            # written while the widget doesn't exist yet in this run.
+            if st.button(
+                "✨ " + tr(f"{n_questions} Fragen generieren", f"Generate {n_questions} questions"),
+                disabled=not topic.strip(),
+            ):
+                with st.spinner(tr(
+                    f"Fragen werden mit {models[0]} generiert...",
+                    f"Generating questions with {models[0]}...",
+                )):
+                    questions, err = generate_questions(api_key, topic, n_questions, models[0])
+                if questions:
+                    st.session_state.w_questions_text = "\n".join(questions)
+                    st.success(tr(
+                        f"{len(questions)} Fragen generiert — unten prüfen und anpassen.",
+                        f"{len(questions)} questions generated — review and adjust them below.",
+                    ))
+                else:
+                    st.error(tr(f"Fragen konnten nicht generiert werden: {err}", f"Could not generate questions: {err}"))
+                    st.info(tr(
+                        "In Schritt 1 „Verbindung testen“ nutzen, um die genaue Ursache zu sehen.",
+                        "Use 'Test connection' in Step 1 to see the exact cause.",
+                    ))
+            st.caption(
+                tr(
+                    f"Generiert mit `{models[0]}` (erstes ausgewähltes Modell).",
+                    f"Generated with `{models[0]}` (first selected model).",
+                )
+                + (tr(" Ersetzt die Fragen unten.", " Replaces the questions below.") if replaces else "")
             )
 
-        st.markdown(f"**{tr('Brand-Erkennung', 'Brand detection')}**")
-        opt_manual = tr("Manuell — Brands vorgeben", "Manual — specify brands")
-        opt_auto   = tr("Automatisch — aus Antworten extrahieren", "Automatic — extract from answers")
-        brand_mode = st.radio(
-            tr("Modus", "Mode"),
-            [opt_manual, opt_auto],
-            help=tr(
-                "Manuell: schneller, kein Extra-Call. Automatisch: ein zusätzlicher API-Call pro Antwort.",
-                "Manual: faster, no extra call. Automatic: one additional API call per answer.",
+        questions_text = st.text_area(
+            tr("Fragen (eine pro Zeile)", "Questions (one per line)"),
+            key="w_questions_text",
+            height=380,
+            placeholder=tr(
+                "Was sind die besten CRM-Tools für kleine Unternehmen?\n"
+                "Welche Anbieter empfiehlst du für Cloud-Hosting?",
+                "What are the best CRM tools for small businesses?\n"
+                "Which providers would you recommend for cloud hosting?",
             ),
         )
-
-        brands_input = ""
-        if brand_mode == opt_manual:
-            brands_input = st.text_input(
-                tr("Brands (kommagetrennt)", "Brands (comma-separated)"),
-                placeholder="Nike, Adidas, ASICS",
-            )
-
-        # Connection test — runs a minimal API call to catch auth/model errors early
-        st.markdown("---")
-        if st.button("🔌 " + tr("Verbindung testen", "Test connection"), disabled=not (api_key and model)):
-            with st.spinner(tr("Teste Verbindung...", "Testing connection...")):
-                ok, msg = test_connection(api_key, model, web_search)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(tr(f"Fehler: {msg}", f"Error: {msg}"))
-                st.info(
-                    tr(
-                        "Häufige Ursachen:\n"
-                        "- API-Key falsch oder abgelaufen\n"
-                        f"- Modell-Name '{model}' nicht verfügbar (Workspace-Einstellungen prüfen)\n"
-                        f"- Falsche Region (aktuell: '{LANGDOCK_REGION}') — mit `LANGDOCK_REGION=us streamlit run app.py` wechseln",
-                        "Common causes:\n"
-                        "- API key wrong or expired\n"
-                        f"- Model name '{model}' not available (check workspace settings)\n"
-                        f"- Wrong region (currently: '{LANGDOCK_REGION}') — switch with `LANGDOCK_REGION=us streamlit run app.py`",
-                    )
-                )
-
-    with col_info:
-        st.subheader(tr("Hinweise", "Notes"))
-        cost_extra_line = tr(
-            "- Analyse: **1 zusätzlicher Call** (Claude Opus 4.8, gesamter Datensatz)",
-            "- Analysis: **1 extra call** (Claude Opus 4.8, whole dataset)",
-        )
-        n_q_for_cost = (
-            n_questions
-            if question_mode == opt_gen
-            else len([q for q in manual_questions_input.splitlines() if q.strip()])
-        )
-        st.markdown(tr(
-            f"""
-**Verbindung testen** bevor du startest — spart Zeit bei Fehlern.
-
-**Thema:** Je spezifischer, desto relevanter die generierten Fragen.
-
-**Modell:** Aktuell `{model or '—'}`. Die Liste wird live aus deinem Workspace geladen ([Agent-API-Katalog](https://docs.langdock.com/en/developer/agents-api/agent-models) bei Websuche, sonst der Passthrough-Katalog) — bei Fehlern "Verbindung testen" nutzen.
-
-**Region:** Aktuell `{LANGDOCK_REGION}`.
-Ändern mit:
-```
-LANGDOCK_REGION=us streamlit run app.py
-```
-
-**Brand-Erkennung:**
-- *Manuell*: Nur angegebene Brands werden getrackt.
-- *Automatisch*: Modell erkennt alle Marken im Text. Ein Extra-Call pro Antwort.
-
-**Kosten (ca.):**
-- **{n_q_for_cost} Fragen** × R Runs = **{n_q_for_cost} × R Calls**
-{cost_extra_line}
-- R (Runs pro Frage) konfigurierst du im nächsten Schritt
-- Analyse lässt sich jederzeit stoppen — bisherige Ergebnisse bleiben erhalten
-        """,
-            f"""
-**Test the connection** before you start — saves time on errors.
-
-**Topic:** The more specific, the more relevant the generated questions.
-
-**Model:** Currently `{model or '—'}`. The list is loaded live from your workspace ([Agent API catalog](https://docs.langdock.com/en/developer/agents-api/agent-models) when web search is on, the passthrough catalog otherwise) — use "Test connection" if you hit errors.
-
-**Region:** Currently `{LANGDOCK_REGION}`.
-Change with:
-```
-LANGDOCK_REGION=us streamlit run app.py
-```
-
-**Brand detection:**
-- *Manual*: Only the specified brands are tracked.
-- *Automatic*: The model detects all brands in the text. One extra call per answer.
-
-**Cost (approx.):**
-- **{n_q_for_cost} questions** × R runs = **{n_q_for_cost} × R calls**
-{cost_extra_line}
-- R (runs per question) is configured in the next step
-- The analysis can be stopped at any time — results so far are kept
-        """,
+        questions = _parse_questions(questions_text)
+        st.caption(tr(
+            f"**{len(questions)} Fragen** — nur diese werden gestellt. Leere Zeilen werden ignoriert.",
+            f"**{len(questions)} questions** — only these will be asked. Empty lines are ignored.",
         ))
+
+    with col_b:
+        st.subheader(tr("Brand-Erkennung", "Brand detection"))
+        brand_mode = st.radio(
+            tr("Modus", "Mode"),
+            ["manual", "auto"],
+            key="w_brand_mode",
+            format_func=lambda o: (
+                tr("Manuell — Brands vorgeben", "Manual — specify brands") if o == "manual"
+                else tr("Automatisch — aus Antworten extrahieren", "Automatic — extract from answers")
+            ),
+        )
+        brands: list[str] = []
+        if brand_mode == "manual":
+            brands = _parse_brands(st.text_input(
+                tr("Brands (kommagetrennt)", "Brands (comma-separated)"),
+                key="w_brands",
+                placeholder="Nike, Adidas, ASICS",
+            ))
+            st.caption(tr(
+                "Die Charts zeigen nur diese Marken; andere genannte Marken werden separat aufgelistet. "
+                "Schon in den Rohdaten siehst du ohne weiteren API-Call, ob sie in Antwort oder Quellen vorkommen.",
+                "The charts show only these brands; other brands mentioned are listed separately. "
+                "The raw data already shows, without another API call, whether they appear in the answer or the sources.",
+            ))
+        else:
+            st.caption(tr(
+                "Die Analyse erkennt alle genannten Marken, Produkte und Anbieter selbst.",
+                "The analysis detects every brand, product, and provider mentioned on its own.",
+            ))
 
     st.divider()
 
-    ready = bool(api_key and model)
-    if question_mode == opt_gen and not topic.strip():
+    ready = True
+    if not questions:
         ready = False
         st.warning(tr(
-            "Bitte ein Thema eingeben, oder auf 'Eigene Fragen eingeben' wechseln.",
-            "Please enter a topic, or switch to 'Enter your own questions'.",
+            "Bitte mindestens eine Frage eingeben oder generieren.",
+            "Please enter or generate at least one question.",
         ))
-    if question_mode == opt_manual_q and not manual_questions_input.strip():
-        ready = False
-        st.warning(tr(
-            "Bitte mindestens eine Frage eingeben, oder auf automatische Generierung wechseln.",
-            "Please enter at least one question, or switch to auto-generate.",
-        ))
-    if brand_mode == opt_manual and not brands_input.strip():
+    if brand_mode == "manual" and not brands:
         ready = False
         st.warning(tr(
             "Bitte mindestens eine Brand eingeben, oder auf automatische Erkennung wechseln.",
             "Please enter at least one brand, or switch to automatic detection.",
         ))
 
-    btn_label = (
-        tr("Weiter: Fragen generieren →", "Next: Generate questions →")
-        if question_mode == opt_gen
-        else tr("Weiter: Fragen prüfen →", "Next: Review questions →")
-    )
-
-    if st.button(btn_label, type="primary", disabled=not ready):
-        brands = (
-            [b.strip() for b in brands_input.split(",") if b.strip()]
-            if brand_mode == opt_manual
-            else []
-        )
-        st.session_state.config = {
-            "api_key":     api_key,
-            "model":       model,
-            "topic":       topic,
-            "n_questions": n_questions,
-            "brand_mode":  "manual" if brand_mode == opt_manual else "auto",
-            "brands":      brands,
-            "web_search":  web_search,
-        }
-        if question_mode == opt_gen:
-            with st.spinner(tr("Fragen werden generiert...", "Generating questions...")):
-                questions, err = generate_questions(api_key, topic, n_questions, model, web_search=web_search)
-            if questions:
-                st.session_state.questions = questions
-                st.session_state.step = 2
-                st.rerun()
-            else:
-                st.error(tr(f"Fragen konnten nicht generiert werden: {err}", f"Could not generate questions: {err}"))
-                st.info(tr(
-                    "Verbindung testen (Button oben) um die genaue Ursache zu sehen.",
-                    "Use 'Test connection' (button above) to see the exact cause.",
-                ))
-        else:
-            st.session_state.questions = [
-                q.strip() for q in manual_questions_input.splitlines() if q.strip()
-            ]
-            st.session_state.step = 2
-            st.rerun()
-
-
-# ===========================================================================
-# UI — Step 2: Review questions
-# One question per line in a text area — free to edit, delete, or add.
-# ===========================================================================
-def render_step2():
-    st.title("📊 LLM Brand Visibility")
-    st.progress(0.25, tr("Schritt 2 von 4 — Fragen prüfen", "Step 2 of 4 — Review questions"))
-    render_tutorial(2)
-    st.divider()
-
-    st.subheader(tr("Fragen prüfen und anpassen", "Review and adjust questions"))
-    st.caption(tr(
-        "Jede Zeile ist eine Frage. Bearbeiten, löschen oder neue ergänzen. "
-        "Leere Zeilen werden ignoriert — die tatsächliche Anzahl siehst du unten.",
-        "Each line is one question. Edit, delete, or add new ones. "
-        "Empty lines are ignored — the actual count is shown below.",
-    ))
-
-    questions_text = st.text_area(
-        tr("Fragen (eine pro Zeile)", "Questions (one per line)"),
-        value="\n".join(st.session_state.questions),
-        height=450,
-    )
-
-    n_lines = len([q for q in questions_text.splitlines() if q.strip()])
-    orig    = len(st.session_state.questions)
-    delta   = n_lines - orig
-    delta_str = (
-        tr(f" ({'+' if delta >= 0 else ''}{delta} gegenüber generiert)",
-           f" ({'+' if delta >= 0 else ''}{delta} vs. generated)")
-        if delta != 0 else ""
-    )
-    st.caption(tr(
-        f"**{n_lines} Fragen**{delta_str} — nur diese werden analysiert.",
-        f"**{n_lines} questions**{delta_str} — only these will be analyzed.",
-    ))
-
     col1, col2 = st.columns([1, 5])
     with col1:
         if st.button(tr("← Zurück", "← Back")):
-            st.session_state.step = 1
-            st.rerun()
+            _go_to(1)
     with col2:
-        if st.button(tr("Weiter: Runs konfigurieren →", "Next: Configure runs →"), type="primary"):
-            cleaned = [q.strip() for q in questions_text.splitlines() if q.strip()]
-            if not cleaned:
-                st.error(tr("Mindestens eine Frage erforderlich.", "At least one question is required."))
-            else:
-                st.session_state.questions = cleaned
-                st.session_state.step = 3
-                st.rerun()
+        if st.button(tr("Weiter: Übersicht & Optionen →", "Next: Overview & options →"),
+                     type="primary", disabled=not ready):
+            _go_to(3)
 
 
 # ===========================================================================
-# UI — Step 3: Configure and start runs
-# Sets run count and delay, then kicks off the analysis loop.
+# UI — Step 3: Overview & options
+# Read top to bottom: 1. check the settings from Steps 1–2, 2. set the run
+# options, 3. review what will run and start the collection.
 # ===========================================================================
+def _overview_card(title: str, edit_step: int, edit_key: str, rows: list[tuple[str, str]]):
+    """Bordered summary block: title + edit button, then one label/value line per row."""
+    with st.container(border=True):
+        col_title, col_edit = st.columns([5, 1])
+        col_title.markdown(f"**{title}**")
+        if col_edit.button("✏️ " + tr("Bearbeiten", "Edit"), key=edit_key, use_container_width=True):
+            _go_to(edit_step)
+        for label, value in rows:
+            col_label, col_value = st.columns([1, 4])
+            col_label.caption(label)
+            col_value.markdown(value)
+
+
 def render_step3():
-    st.title("📊 LLM Brand Visibility")
-    st.progress(0.5, tr("Schritt 3 von 4 — Runs konfigurieren", "Step 3 of 4 — Configure runs"))
-    render_tutorial(3)
-    st.divider()
+    render_step_header(3)
 
-    cfg  = st.session_state.config
-    n_q  = len(st.session_state.questions)
-    auto = cfg["brand_mode"] == "auto"
+    api_key       = st.session_state.w_api_key
+    models        = st.session_state.selected_models
+    questions     = _parse_questions(st.session_state.w_questions_text)
+    question_mode = st.session_state.w_question_mode
+    topic         = st.session_state.w_topic.strip() if question_mode == "generate" else ""
+    brand_mode    = st.session_state.w_brand_mode
+    brands        = _parse_brands(st.session_state.w_brands) if brand_mode == "manual" else []
+    n_q           = len(questions)
+
+    if not (api_key and models):
+        st.warning(tr("Bitte zuerst in Schritt 1 API-Key und Modelle festlegen.",
+                      "Please set the API key and models in Step 1 first."))
+        if st.button(tr("← Zu Schritt 1", "← To Step 1")):
+            _go_to(1)
+        return
+    if not questions or (brand_mode == "manual" and not brands):
+        st.warning(tr("Bitte zuerst in Schritt 2 Fragen und Brands festlegen.",
+                      "Please set the questions and brands in Step 2 first."))
+        if st.button(tr("← Zu Schritt 2", "← To Step 2")):
+            _go_to(2)
+        return
 
     # Answers from a collection run that was stopped or interrupted. Streamlit tears
     # the collection down as soon as any button is clicked, so we land back here —
@@ -2670,269 +2566,194 @@ def render_step3():
             type="primary",
         ):
             st.session_state.setdefault("timing", {}).setdefault("p1_calls", [])
-            st.session_state.step = 4
-            st.rerun()
+            _go_to(4)
         if col_drop.button(tr("Verwerfen und neu sammeln", "Discard and collect again")):
             st.session_state.raw_answers   = []
             st.session_state.phase1_errors = []
             st.rerun()
         st.divider()
 
-    st.subheader(tr("Runs konfigurieren", "Configure runs"))
+    # --- 1. Settings from Steps 1 and 2 ----------------------------------------
+    st.subheader(tr("1. Einstellungen prüfen", "1. Check your settings"))
 
-    col_form, col_summary = st.columns([3, 2])
+    _overview_card(
+        tr("Verbindung & Modelle (Schritt 1)", "Connection & models (Step 1)"),
+        1, "s3_edit_step1",
+        [
+            (tr("API-Key", "API key"), tr(f"✅ gesetzt (`…{api_key[-4:]}`)", f"✅ set (`…{api_key[-4:]}`)")),
+            (tr(f"Modelle ({len(models)})", f"Models ({len(models)})"), "  \n".join(f"`{m}`" for m in models)),
+        ],
+    )
 
-    with col_form:
-        # --- Features (what the API can do) -------------------------------
-        st.markdown(f"**{tr('Features', 'Features')}**")
+    question_rows = [(
+        tr("Anzahl", "Count"),
+        tr(f"{n_q} Fragen", f"{n_q} questions") + " · " + (
+            tr("automatisch generiert", "auto-generated") if question_mode == "generate"
+            else tr("selbst eingegeben", "entered manually")
+        ),
+    )]
+    if topic:
+        question_rows.append((tr("Thema", "Topic"), topic))
+    _overview_card(tr("Fragen (Schritt 2)", "Questions (Step 2)"), 2, "s3_edit_questions", question_rows)
+    with st.expander(tr(f"Alle {n_q} Fragen anzeigen", f"Show all {n_q} questions")):
+        st.markdown("\n".join(f"{i}. {q}" for i, q in enumerate(questions, 1)))
+
+    _overview_card(
+        tr("Brand-Erkennung (Schritt 2)", "Brand detection (Step 2)"),
+        2, "s3_edit_brands",
+        [(tr("Modus", "Mode"), tr("Manuell", "Manual") if brand_mode == "manual" else tr("Automatisch", "Automatic"))]
+        + ([(tr("Brands", "Brands"), ", ".join(f"`{b}`" for b in brands))] if brands else []),
+    )
+
+    # --- 2. Run options ------------------------------------------------------
+    st.subheader(tr("2. Optionen festlegen", "2. Set the options"))
+
+    with st.container(border=True):
+        st.markdown(f"**{tr('Antwortverhalten', 'Answer behaviour')}**")
+
         web_search = st.checkbox(
             "🔍 " + tr("Websuche", "Web search"),
-            value=cfg.get("web_search", True),
+            key="w_web_search",
             help=tr(
-                "capabilities.webSearch der Agent-API — das Modell bekommt ein echtes Such-Tool. "
-                "Schaltet die Modell-Liste auf den Agent-API-Katalog um.",
-                "capabilities.webSearch of the Agent API — the model gets a real search tool. "
-                "Switches the model list to the Agent API catalog.",
+                "capabilities.webSearch der Agent-API — das Modell bekommt ein echtes Such-Tool und "
+                "wird angewiesen, es für Marken-/Produktfragen zu nutzen.",
+                "capabilities.webSearch of the Agent API — the model gets a real search tool and is "
+                "instructed to use it for brand/product questions.",
             ),
         )
-
-        current_model = cfg.get("model", "")
-        api_key       = cfg.get("api_key", "")
-        agent_catalog: list[dict] = []
-        models: list[str] = []
-
-        st.markdown(f"**{tr('Modelle', 'Models')}**")
-        if web_search:
-            models, agent_catalog = render_agent_model_multiselect(
-                api_key, cfg.get("models") or ([current_model] if current_model else []), key_prefix="s3",
-            )
-            model = models[0] if models else ""
-        else:
-            catalog, probe_failed = list_completion_models(api_key)
-            render_passthrough_probe_notice(probe_failed)
-            flat    = [(p, m) for p, ms in catalog.items() for m in ms]
-            if not flat:
-                st.info(tr(
-                    "API-Key eingeben, um die verfügbaren Modelle zu laden.",
-                    "Enter an API key to load the available models.",
-                ) if not api_key else tr(
-                    "Keine Modell-Liste verfügbar — bitte die Modell-IDs unten manuell eingeben.",
-                    "No model list available — please enter the model IDs manually below.",
-                ))
-            ids     = [m for _, m in flat]
-            labels  = {m: f"{p}  ·  {m}" for p, m in flat}
-            default = [m for m in (cfg.get("models") or [current_model]) if m in ids] or ids[:1]
-            models  = st.multiselect(
-                tr("Modelle für die Datensammlung", "Models for data collection"),
-                options=ids,
-                default=default,
-                format_func=lambda i: labels.get(i, i),
-                help=tr(
-                    "Mehrere Modelle = jede Frage wird mit jedem Modell gesammelt, direkt vergleichbar.",
-                    "Several models = every question is collected with every model, directly comparable.",
-                ),
-            )
-            extra = st.text_input(
-                tr("Zusätzliche Modell-IDs (kommagetrennt, optional)",
-                   "Additional model IDs (comma-separated, optional)"),
-                placeholder="z.B. gpt-4o-search-preview",
-            )
-            models += [m.strip() for m in extra.split(",") if m.strip() and m.strip() not in models]
-            model = models[0] if models else ""
-
-        # --- Optional extras -----------------------------------------------
-        st.markdown(f"**{tr('Optionen', 'Options')}**")
-        col_opt1, col_opt2 = st.columns(2)
-
-        with col_opt1:
-            # Only offered on the Agent path, and only when every selected model
-            # reports supportsExtendedThinking — Langdock 400s if it can't do it.
-            et_capable = {m["id"] for m in agent_catalog if m.get("supportsExtendedThinking")}
-            et_missing = [m for m in models if m not in et_capable] if agent_catalog else models
-            et_possible = bool(web_search and models and not et_missing)
-            extended_thinking = st.checkbox(
-                "🧠 " + tr("Extended Thinking", "Extended thinking"),
-                value=cfg.get("extended_thinking", False) and et_possible,
-                disabled=not et_possible,
-                help=tr(
-                    "capabilities.extendedThinking der Agent-API: das Modell denkt vor der Antwort "
-                    "ausführlicher nach. Nur für Modelle, die laut GET /agent/v1/models "
-                    "supportsExtendedThinking melden. Kostet mehr Tokens und Zeit; der Denkprozess "
-                    "landet nicht in der Antwort.",
-                    "capabilities.extendedThinking of the Agent API: the model reasons more before "
-                    "answering. Only for models that report supportsExtendedThinking in "
-                    "GET /agent/v1/models. Costs more tokens and time; the reasoning itself does not "
-                    "appear in the answer.",
-                ),
-            )
-            if web_search and et_missing and models:
-                st.caption(tr(
-                    f"Nicht verfügbar für: {', '.join(et_missing)}",
-                    f"Not available for: {', '.join(et_missing)}",
-                ))
-            elif not web_search:
-                st.caption(tr("Nur mit Websuche (Agent-API).", "Only with web search (Agent API)."))
-
-            short_answer = st.toggle(
-                "✂️ " + tr("Kurzantwort-Modus", "Short-answer mode"),
-                value=cfg.get("short_answer", False),
-                help=tr(
-                    "LLM gibt nur Marken + einen Begründungssatz zurück. Viel weniger Tokens, schneller, günstiger.",
-                    "The LLM returns only brands + one sentence of reasoning. Far fewer tokens, faster, cheaper.",
-                ),
-            )
-
-        with col_opt2:
-            market = st.text_input(
-                "🌍 " + tr("Markt / Region", "Market / region"),
-                value=cfg.get("market", ""),
-                placeholder=tr("z.B. Deutschland, DACH, UK", "e.g. Germany, DACH, UK"),
-                help=tr(
-                    "Die Langdock-API hat KEINEN Location-Parameter (weder im Agent-Objekt noch in "
-                    "capabilities). Der Markt wird deshalb über den Prompt gesteuert: das Modell "
-                    "antwortet aus Sicht dieses Marktes und bevorzugt Quellen von dort. Leer lassen = "
-                    "keine Vorgabe.",
-                    "The Langdock API has NO location parameter (neither on the agent object nor in "
-                    "capabilities). The market is therefore steered through the prompt: the model "
-                    "answers from that market's perspective and prefers sources from there. Leave "
-                    "empty for no constraint.",
-                ),
-            )
-            st.caption(tr(
-                f"Temperatur: {COLLECTION_TEMPERATURE} (Sammlung) / {ANALYSIS_TEMPERATURE} (Analyse)",
-                f"Temperature: {COLLECTION_TEMPERATURE} (collection) / {ANALYSIS_TEMPERATURE} (analysis)",
-            ))
-
-        st.markdown(f"**{tr('Umfang', 'Scope')}**")
-        runs = st.slider(tr("Wie oft soll jede Frage ausgeführt werden?", "How many times should each question run?"), 1, 100, 2)
-
-        parallel_calls = st.slider(
-            tr("Parallele API-Calls", "Parallel API calls"),
-            min_value=1, max_value=10, value=2,
-            help=tr(
-                "Standard 2 bleibt sicher unter dem 60k-TPM-Limit (~32k geschätzt). Höher = schneller, aber "
-                "größeres Risiko für 429-Rate-Limits.",
-                "The default of 2 stays safely under the 60k TPM limit (~32k estimated). Higher = faster, but "
-                "a greater risk of 429 rate limits.",
-            ),
-        )
-
-        if web_search:
-            # The Agent API doesn't accept a max_tokens parameter, so the slider/TPM
-            # gauge below don't apply — hide them to avoid implying a control that
-            # has no effect on this endpoint.
-            max_tokens_val = MAX_TOKENS
-            st.caption(tr(
-                "ℹ️ Token-Limit pro Antwort ist bei aktiver Websuche (Agent-API) nicht einstellbar.",
-                "ℹ️ Per-answer token limit is not adjustable while web search (Agent API) is active.",
-            ))
-        else:
-            max_tokens_val = st.slider(
-                tr("Max. Tokens pro Antwort", "Max tokens per answer"),
-                min_value=500, max_value=16000, value=MAX_TOKENS, step=500,
-                help=tr(
-                    "Bei Reasoning-Modellen (gpt-5-mini) fließen interne Denkschritte ins Budget ein — "
-                    "mindestens 8000 einplanen. gpt-5-mini-eu: 60.000 Tokens/Minute Limit.",
-                    "For reasoning models (gpt-5-mini), internal thinking steps count against the budget — "
-                    "plan for at least 8000. gpt-5-mini-eu: 60,000 tokens/minute limit.",
-                ),
-            )
-
-            # Live TPM estimate — assumes ~30s avg response time for reasoning models
-            assumed_resp_s = 30
-            calls_per_min  = parallel_calls * (60 / assumed_resp_s)
-            tpm_estimate   = int(calls_per_min * max_tokens_val)
-            tpm_pct        = tpm_estimate / 60000 * 100
-            tpm_color      = "🟢" if tpm_pct < 70 else ("🟡" if tpm_pct < 100 else "🔴")
-            st.caption(tr(
-                f"{tpm_color} Geschätzte Token-Last: **{tpm_estimate:,} Tokens/min** "
-                f"({tpm_pct:.0f}% des 60k-Limits bei gpt-5-mini) — "
-                f"Annahme: {assumed_resp_s}s Ø Antwortzeit, {parallel_calls} parallel",
-                f"{tpm_color} Estimated token load: **{tpm_estimate:,} tokens/min** "
-                f"({tpm_pct:.0f}% of the 60k limit for gpt-5-mini) — "
-                f"assuming {assumed_resp_s}s avg. response time, {parallel_calls} parallel",
-            ))
-
-        delay = st.slider(
-            tr("Pause zwischen API-Calls (Sekunden)", "Pause between API calls (seconds)"),
-            min_value=0.0, max_value=5.0, value=0.5, step=0.5,
-            help=tr(
-                "Pause nach jedem Call (sequenziell) bzw. nach jedem abgeschlossenen Batch (parallel).",
-                "Pause after each call (sequential) or after each completed batch (parallel).",
-            ),
-            disabled=parallel_calls > 1,
-        )
-
-        # Call estimate. Phase 1 = one collection call per question×run×model.
-        # Phase 2 batches the whole dataset regardless of how many models produced it.
-        n_models         = max(len(models), 1)
-        collection_calls = n_q * runs * n_models
-        st.success(tr(
-            f"Sammlung: **{collection_calls} Calls** ({n_q} Fragen × {runs} Runs × {n_models} Modelle). "
-            f"Analyse: **1 Call** ({ANALYSIS_MODEL}, gesamter Datensatz).",
-            f"Collection: **{collection_calls} calls** ({n_q} questions × {runs} runs × {n_models} models). "
-            f"Analysis: **1 call** ({ANALYSIS_MODEL}, whole dataset).",
-        ))
-        if not auto and cfg.get("brands"):
-            st.caption(tr(
-                f"Vorgegebene Brands: {', '.join(cfg['brands'])}",
-                f"Specified brands: {', '.join(cfg['brands'])}",
-            ))
-
-        if web_search:
-            st.info(tr(
-                "Websuche aktiv — läuft über die Langdock Agent-API (separater Endpunkt, kein Token-Reporting, "
-                "kann länger dauern).",
-                "Web search active — runs via the Langdock Agent API (separate endpoint, no token reporting, "
-                "can take longer).",
-            ))
-
         st.caption(tr(
-            "Du kannst die Analyse jederzeit stoppen — bisherige Ergebnisse werden trotzdem angezeigt.",
-            "You can stop the analysis at any time — results so far will still be shown.",
+            "Die Modelle recherchieren live im Web. Aus = Antworten nur aus dem Trainingswissen.",
+            "The models research live on the web. Off = answers from training knowledge only.",
         ))
 
-    with col_summary:
-        st.markdown(f"**{tr('Zusammenfassung', 'Summary')}**")
-        st.metric(tr("Fragen", "Questions"), n_q)
-        st.metric(tr("Runs pro Frage", "Runs per question"), runs)
-        st.metric(tr("Modelle", "Models"), len(models))
-        st.metric(tr("Sammel-Calls", "Collection calls"), n_q * runs * max(len(models), 1))
-        st.metric(tr("Analyse-Calls", "Analysis calls"), 1)
-        if models:
-            st.caption("· " + "\n\n· ".join(models))
-        active = [
-            x for x in (
-                "🔍 " + tr("Websuche", "Web search") if web_search else "",
-                "🧠 Extended Thinking" if extended_thinking else "",
-                "✂️ " + tr("Kurzantwort", "Short answer") if short_answer else "",
-                f"🌍 {market}" if market.strip() else "",
-            ) if x
-        ]
-        if active:
-            st.caption(tr("Aktiv: ", "Active: ") + " · ".join(active))
+        # Only offered when every selected model reports supportsExtendedThinking in
+        # GET /agent/v1/models — Langdock 400s if it can't do it.
+        catalog, _ = fetch_agent_models(api_key)
+        catalog_ids = [m["id"] for m in catalog]
+        et_capable  = {m["id"] for m in catalog if m.get("supportsExtendedThinking")}
+        et_missing  = [m for m in models if catalog_equivalent(m, catalog_ids) not in et_capable]
+        et_possible = bool(catalog) and not et_missing
+        if not et_possible:
+            st.session_state.w_extended_thinking = False
+        extended_thinking = st.checkbox(
+            "🧠 " + tr("Extended Thinking", "Extended thinking"),
+            key="w_extended_thinking",
+            disabled=not et_possible,
+            help=tr(
+                "capabilities.extendedThinking der Agent-API. Nur für Modelle, die laut "
+                "GET /agent/v1/models supportsExtendedThinking melden.",
+                "capabilities.extendedThinking of the Agent API. Only for models that report "
+                "supportsExtendedThinking in GET /agent/v1/models.",
+            ),
+        )
+        st.caption(
+            tr(
+                "Das Modell denkt vor der Antwort länger nach. Kostet mehr Tokens und Zeit.",
+                "The model reasons longer before answering. Costs more tokens and time.",
+            )
+            + (tr(f" Nicht verfügbar für: {', '.join(et_missing)}",
+                  f" Not available for: {', '.join(et_missing)}") if et_missing else "")
+        )
 
-    st.divider()
+        short_answer = st.checkbox(
+            "✂️ " + tr("Kurzantwort-Modus", "Short-answer mode"),
+            key="w_short_answer",
+        )
+        st.caption(tr(
+            "Nur „Marke — ein Satz Begründung“ statt Fließtext. Schneller und günstiger, "
+            "aber weniger realistisch für die Sentiment-Analyse.",
+            "Only \"brand — one sentence of reasoning\" instead of prose. Faster and cheaper, "
+            "but less realistic for the sentiment analysis.",
+        ))
+
+    with st.container(border=True):
+        st.markdown(f"**{tr('Umfang', 'Scope')}**")
+        col_runs, col_parallel = st.columns(2)
+        with col_runs:
+            runs = st.slider(tr("Runs pro Frage", "Runs per question"), 1, 100, key="w_runs")
+            st.caption(tr(
+                "Wie oft jede Frage gestellt wird. Mehr Runs = stabilere Statistik (empfohlen: 3–10).",
+                "How often each question is asked. More runs = more stable statistics (recommended: 3–10).",
+            ))
+        with col_parallel:
+            parallel_calls = st.slider(tr("Parallele Calls", "Parallel calls"), 1, 10, key="w_parallel")
+            st.caption(tr(
+                "Anfragen gleichzeitig. Höher = schneller, aber mehr Rate-Limit-Wartezeiten (Standard: 2).",
+                "Requests at the same time. Higher = faster, but more rate-limit waits (default: 2).",
+            ))
+
+    # --- 3. What will run --------------------------------------------------------
+    st.subheader(tr("3. Lauf starten", "3. Start the run"))
+    analysis_model, analysis_from_catalog = resolve_analysis_model(api_key)
+    collection_calls = n_q * runs * len(models)
+
+    with st.container(border=True):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(tr("Fragen", "Questions"), n_q)
+        m2.metric(tr("× Runs", "× Runs"), runs)
+        m3.metric(tr("× Modelle", "× Models"), len(models))
+        m4.metric(tr("= Sammel-Calls", "= Collection calls"), collection_calls)
+
+        search_label = tr("mit Websuche", "with web search") if web_search else tr("ohne Websuche", "without web search")
+        extras = [x for x in (
+            "Extended Thinking" if extended_thinking else "",
+            tr("Kurzantworten", "short answers") if short_answer else "",
+        ) if x]
+        st.markdown(tr(
+            f"**Phase 1 — Antworten sammeln** (jetzt): {collection_calls} Calls {search_label}"
+            + (f", {', '.join(extras)}" if extras else "") + f", {parallel_calls} parallel.",
+            f"**Phase 1 — Collect answers** (now): {collection_calls} calls {search_label}"
+            + (f", {', '.join(extras)}" if extras else "") + f", {parallel_calls} in parallel.",
+        ))
+        st.markdown(tr(
+            f"**Phase 2 — Analyse** (nach Prüfung in Schritt 4): wenige gebündelte Calls mit `{analysis_model}`.",
+            f"**Phase 2 — Analysis** (after review in Step 4): a few batched calls with `{analysis_model}`.",
+        ))
+        st.caption(
+            (tr("Neuestes Claude Opus aus deinem Workspace.", "Newest Claude Opus in your workspace.")
+             if analysis_from_catalog else
+             "⚠️ " + tr("Opus-Liste nicht abrufbar — Standardmodell wird verwendet.",
+                        "Could not read the Opus list — using the default model."))
+            + " " + tr(
+                f"Temperatur: {COLLECTION_TEMPERATURE} (Sammlung) / {ANALYSIS_TEMPERATURE} (Analyse).",
+                f"Temperature: {COLLECTION_TEMPERATURE} (collection) / {ANALYSIS_TEMPERATURE} (analysis).",
+            )
+        )
+
+    if not web_search:
+        st.warning(tr(
+            "Websuche ist aus — die Modelle antworten nur aus ihrem Trainingswissen.",
+            "Web search is off — the models answer from their training knowledge only.",
+        ))
 
     col1, col2 = st.columns([1, 5])
     with col1:
         if st.button(tr("← Zurück", "← Back")):
-            st.session_state.step = 2
-            st.rerun()
+            _go_to(2)
     with col2:
-        if st.button("🚀 " + tr("Daten sammeln", "Collect data"), type="primary", disabled=not models):
-            st.session_state.config["models"]            = models
-            st.session_state.config["model"]             = model  # first model — default for exports
-            st.session_state.config["web_search"]        = web_search
-            st.session_state.config["runs"]              = runs
-            st.session_state.config["delay"]             = delay
-            st.session_state.config["parallel_calls"]    = parallel_calls
-            st.session_state.config["max_tokens"]        = max_tokens_val
-            st.session_state.config["short_answer"]      = short_answer
-            st.session_state.config["extended_thinking"] = extended_thinking
-            st.session_state.config["market"]            = market
-            st.session_state.stop_requested              = False
+        if st.button("🚀 " + tr(f"{collection_calls} Antworten sammeln", f"Collect {collection_calls} answers"),
+                     type="primary"):
+            st.session_state.questions = questions
+            st.session_state.config = {
+                "api_key":           api_key,
+                "models":            models,
+                "model":             models[0],  # first model — default for exports
+                "question_mode":     question_mode,
+                "topic":             topic,
+                "brand_mode":        brand_mode,
+                "brands":            brands,
+                "web_search":        web_search,
+                "extended_thinking": extended_thinking and et_possible,
+                "short_answer":      short_answer,
+                "runs":              runs,
+                "parallel_calls":    parallel_calls,
+            }
+            st.session_state.stop_requested = False
             _run_phase1()
+    st.caption(tr(
+        "Die Sammlung lässt sich jederzeit stoppen — bisherige Antworten bleiben erhalten.",
+        "The collection can be stopped at any time — answers collected so far are kept.",
+    ))
 
 
 def download_with_name(label: str, data: bytes, default_name: str, mime: str, key: str) -> None:
@@ -2987,13 +2808,10 @@ def _run_phase1():
     api_key    = cfg["api_key"]
     model      = cfg["model"]
     runs       = cfg["runs"]
-    delay      = cfg["delay"]
     parallel     = cfg.get("parallel_calls", 1)
-    max_tokens   = cfg.get("max_tokens", MAX_TOKENS)
     web_search   = cfg.get("web_search", False)
     short_answer = cfg.get("short_answer", False)
     ext_thinking = cfg.get("extended_thinking", False)
-    market       = cfg.get("market", "")
     # One or more models: every question is asked once per model per run, so the
     # models can be compared on identical questions within a single dataset.
     models       = cfg.get("models") or [cfg["model"]]
@@ -3020,8 +2838,6 @@ def _run_phase1():
             "run":             run_num + 1,
             "answer":          answer,
             "model":           model,
-            "tokens_in":       usage.get("prompt_tokens", 0),
-            "tokens_out":      usage.get("completion_tokens", 0),
             # web-search evidence (only populated when web_search routed via the Agent API)
             "web_search_used": usage.get("web_search_used", False),
             "sources":         usage.get("sources", []),
@@ -3059,8 +2875,8 @@ def _run_phase1():
         """
         t_start = time.time()
         answer, err, usage = ask_question(
-            api_key, question, mdl, lang, web_search, max_tokens, short_answer,
-            extended_thinking=ext_thinking, market=market,
+            api_key, question, mdl, lang, web_search, short_answer,
+            extended_thinking=ext_thinking,
         )
         return answer, err, usage, time.time() - t_start
 
@@ -3124,9 +2940,8 @@ def _run_phase1():
             else:
                 error_box.empty()
                 _record_answer(question, run_num, answer, usage, task_model)
-                log.info("Phase1 OK — Frage %d Run %d | model=%s | len=%d | tok_in=%d tok_out=%d | web_search=%s | sources=%d | %.2fs",
+                log.info("Phase1 OK — Frage %d Run %d | model=%s | len=%d | web_search=%s | sources=%d | %.2fs",
                          i+1, run_num+1, task_model, len(answer),
-                         usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
                          usage.get("web_search_used", False), len(usage.get("sources", [])), call_elapsed)
 
             q_short = question[:60] + ("…" if len(question) > 60 else "")
@@ -3134,9 +2949,6 @@ def _run_phase1():
                 f"Zuletzt: Frage {i+1} · Run {run_num+1} · {task_model} · {call_elapsed:.1f}s · {q_short}",
                 f"Latest: Question {i+1} · Run {run_num+1} · {task_model} · {call_elapsed:.1f}s · {q_short}",
             ))
-
-            if parallel == 1:
-                time.sleep(delay)
 
     # ------------------------------------------------------------------
     # Retry pass — one more attempt for calls that failed above. Only runs if the
@@ -3236,11 +3048,16 @@ def _normalize_brand_key(name: str) -> str:
 def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = None):
     """
     Phase 2: brand extraction + sentiment for the whole dataset, batched across one or
-    more calls to a single strong model (ANALYSIS_MODEL / Claude Opus 4.8). The model
-    returns flat JSON arrays that we regroup per answer.
+    more calls to a single strong model (the newest Claude Opus, see
+    resolve_analysis_model). The model returns flat JSON arrays that we regroup per answer.
     """
     cfg      = st.session_state.config
     api_key  = cfg["api_key"]
+    # Resolved at analysis time, not taken from Step 3: a re-analysis later in the
+    # session should pick up a newer Opus, and the display in Step 5 must show the
+    # model that actually ran.
+    analysis_model, _ = resolve_analysis_model(api_key)
+    cfg["analysis_model"] = analysis_model
     model    = cfg["model"]  # collection model — kept per-answer for the results table
     brands   = cfg.get("brands", [])
     lang     = st.session_state.get("lang", "de")
@@ -3289,8 +3106,8 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
 
     st.subheader(tr("Phase 2 — Brand & Sentiment Analyse", "Phase 2 — Brand & sentiment analysis"))
     st.caption(tr(
-        f"{n_answers} Antworten in einem Durchlauf mit `{ANALYSIS_MODEL}` analysieren.",
-        f"Analyzing {n_answers} answers in a single pass with `{ANALYSIS_MODEL}`.",
+        f"{n_answers} Antworten in einem Durchlauf mit `{analysis_model}` analysieren.",
+        f"Analyzing {n_answers} answers in a single pass with `{analysis_model}`.",
     ))
 
     # Analysis is batched, so a large dataset no longer risks a single truncated call.
@@ -3311,11 +3128,11 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
     reset_run_abort()   # a limit hit during collection must not block a later analysis
     reset_dead_models()  # ditto for a model retired during collection — analysis runs its own model
     status_line.caption(tr(
-        f"Analyse läuft mit {ANALYSIS_MODEL} …",
-        f"Analysis running with {ANALYSIS_MODEL} …",
+        f"Analyse läuft mit {analysis_model} …",
+        f"Analysis running with {analysis_model} …",
     ))
 
-    by_index, summary, usage, analysis_err = analyze_dataset(api_key, raw_answers, brands, lang)
+    by_index, summary, usage, analysis_err = analyze_dataset(api_key, raw_answers, brands, lang, analysis_model)
     phase2_elapsed = time.time() - t_phase2
     bar2.progress(1.0)
 
@@ -3333,8 +3150,6 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
             "run":             raw["run"],
             "answer":          raw["answer"],
             "model":           raw.get("model", model),
-            "tokens_in":       raw.get("tokens_in", 0),
-            "tokens_out":      raw.get("tokens_out", 0),
             "tokens_analysis": analysis_tokens,
             "brands_found":    merged,
         })
@@ -3343,7 +3158,7 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
     st.session_state.unlisted_brands = sorted(unlisted_seen.values(), key=str.lower) if brands else []
     log.info(
         "Phase2 OK — %d answers analyzed via %s (batched) | %.2fs | brands total: %d | unlisted: %d",
-        n_answers, ANALYSIS_MODEL, phase2_elapsed,
+        n_answers, analysis_model, phase2_elapsed,
         sum(len(r["brands_found"]) for r in results), len(unlisted_seen),
     )
 
@@ -3374,6 +3189,21 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
     st.rerun()
 
 
+def _web_search_cell(r: dict) -> str:
+    """Raw-data table cell: did web search verifiably run, and how many sources back it."""
+    if not r.get("web_search_used"):
+        return tr("❌ nicht gesucht", "❌ not searched")
+    n_sources = len(r.get("sources", []) or [])
+    if n_sources:
+        return tr(f"✅ {n_sources} Quelle{'n' if n_sources != 1 else ''}",
+                  f"✅ {n_sources} source{'s' if n_sources != 1 else ''}")
+    n_citations = r.get("citation_count", 0)
+    if n_citations:
+        return tr(f"✅ {n_citations} Zitat{'e' if n_citations != 1 else ''} (keine URLs)",
+                  f"✅ {n_citations} citation{'s' if n_citations != 1 else ''} (no URLs)")
+    return tr("✅ ohne Quellenangabe", "✅ no sources returned")
+
+
 # ===========================================================================
 # UI — Step 4: Raw data checkpoint
 # Shown right after Phase 1 (data collection) and before Phase 2 (brand/
@@ -3381,10 +3211,7 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
 # before spending extra API calls on analysis, or restart from scratch.
 # ===========================================================================
 def render_step4():
-    st.title("📊 LLM Brand Visibility")
-    st.progress(0.75, tr("Schritt 4 von 4 — Rohdaten prüfen", "Step 4 of 4 — Review raw data"))
-    render_tutorial(4)
-    st.divider()
+    render_step_header(4)
 
     raw_answers = st.session_state.get("raw_answers", [])
     errors      = st.session_state.get("phase1_errors", [])
@@ -3455,10 +3282,8 @@ def render_step4():
     show_search = bool(cfg.get("web_search"))
     col_frage   = tr("Frage", "Question")
     col_modell  = tr("Modell", "Model")
-    col_suche   = tr("🔍 Suche", "🔍 Search")
+    col_suche   = tr("🔍 Websuche erfolgreich · Quellen", "🔍 Web search succeeded · sources")
     col_antwort = tr("Antwort", "Answer")
-    col_tok_in  = tr("Tok. Input", "Tok. input")
-    col_tok_out = tr("Tok. Antwort", "Tok. answer")
     col_brands  = tr("Brands", "Brands")
     cfg_brands  = cfg.get("brands", []) or []
     raw_rows = []
@@ -3476,18 +3301,32 @@ def render_step4():
             marks = [b for b in in_answer] + [f"🔗{b}" for b in in_sources if b not in in_answer]
             row[col_brands] = ", ".join(marks) if marks else "—"
         if show_search:
-            # Prefer a source count; fall back to the citation-marker count as evidence.
-            n_evidence = len(r.get("sources", [])) or r.get("citation_count", 0)
-            row[col_suche] = ("✅ " + (f"{n_evidence}" if n_evidence else "")) if r.get("web_search_used") else "—"
+            row[col_suche] = _web_search_cell(r)
         row[col_antwort] = (r["answer"][:200] + "...") if len(r["answer"]) > 200 else r["answer"]
-        row[col_tok_in]  = r.get("tokens_in", 0)
-        row[col_tok_out] = r.get("tokens_out", 0)
         raw_rows.append(row)
-    st.dataframe(pd.DataFrame(raw_rows), width="stretch")
+    st.dataframe(
+        pd.DataFrame(raw_rows),
+        width="stretch",
+        column_config={
+            col_suche: st.column_config.TextColumn(
+                col_suche,
+                help=tr(
+                    "Ob das Modell für diese Antwort nachweislich im Web gesucht hat, und wie viele "
+                    "Quellen-URLs die API dazu geliefert hat. Ohne URLs wird die Zahl der Zitat-Marker "
+                    "im Antworttext gezeigt.",
+                    "Whether the model verifiably searched the web for this answer, and how many source "
+                    "URLs the API returned. Without URLs, the number of citation markers in the answer "
+                    "text is shown instead.",
+                ),
+            ),
+        },
+    )
     if show_search:
         st.caption(tr(
-            "🔍 Suche: ✅ = Such-Tool nachweislich genutzt (Zahl = Quellen bzw. Zitat-Marker), — = nicht genutzt.",
-            "🔍 Search: ✅ = search tool verifiably used (number = sources or citation markers), — = not used.",
+            "🔍 ✅ n Quellen = Websuche erfolgreich, n verlinkte Quellen · ✅ n Zitate = gesucht, aber "
+            "die API lieferte keine URLs · ❌ = das Modell hat nicht gesucht.",
+            "🔍 ✅ n sources = web search succeeded, n linked sources · ✅ n citations = searched, but "
+            "the API returned no URLs · ❌ = the model did not search.",
         ))
 
     # --- Full Q&A, one expander per answer -------------------------------
@@ -3606,15 +3445,17 @@ def render_step5():
     results = st.session_state.results
     cfg     = st.session_state.config
 
-    # --- Configuration summary (from Step 1 + Step 3) ----------------------
+    # --- Configuration summary (from Steps 1–3) -----------------------------
     with st.expander(tr("Analyse-Konfiguration", "Analysis configuration"), expanded=True):
         c1, c2, c3, c4 = st.columns(4)
         topic_display = (cfg.get("topic") or "").strip() or "—"
         c1.markdown(f"**{tr('Thema', 'Topic')}**  \n{topic_display}")
+        collection_models = cfg.get("models") or [cfg.get("model", "—")]
+        analysis_model    = cfg.get("analysis_model", "—")
         c2.markdown(
-            f"**{tr('Modell', 'Model')}**  \n"
-            f"`{cfg.get('model', '—')}`  \n"
-            + tr(f"Analyse: `{ANALYSIS_MODEL}`", f"Analysis: `{ANALYSIS_MODEL}`")
+            f"**{tr('Modelle', 'Models')}**  \n"
+            + "  \n".join(f"`{m}`" for m in collection_models) + "  \n"
+            + tr(f"Analyse: `{analysis_model}`", f"Analysis: `{analysis_model}`")
         )
         runs_val     = cfg.get("runs", "—")
         parallel_val = cfg.get("parallel_calls", 1)
@@ -3623,16 +3464,9 @@ def render_step5():
             f"**Fragen / Runs**  \n{n_q} Fragen × {runs_val} Runs",
             f"**Questions / Runs**  \n{n_q} questions × {runs_val} runs",
         ))
-        # max_tokens is meaningless when web search (Agent API) was used — omit it then.
-        tokens_part = "" if cfg.get("web_search") else tr(
-            f" | max {cfg.get('max_tokens', MAX_TOKENS)} Tokens",
-            f" | max {cfg.get('max_tokens', MAX_TOKENS)} tokens",
-        )
         c4.markdown(tr(
-            f"**Parallel / Delay / Tokens**  \n"
-            f"{parallel_val} parallel | {cfg.get('delay', 0.5)}s Pause{tokens_part}",
-            f"**Parallel / Delay / Tokens**  \n"
-            f"{parallel_val} parallel | {cfg.get('delay', 0.5)}s pause{tokens_part}",
+            f"**Parallele Calls**  \n{parallel_val}",
+            f"**Parallel calls**  \n{parallel_val}",
         ))
 
         brand_mode = cfg.get("brand_mode", "auto")
@@ -3660,8 +3494,14 @@ def render_step5():
                 "**Brand detection:** Automatic (extracted from answers)",
             ))
 
-        if cfg.get("web_search"):
-            st.markdown(tr("**Websuche:** Aktiv (Agent-API)", "**Web search:** Active (Agent API)"))
+        options = [
+            tr("Websuche an", "Web search on") if cfg.get("web_search") else tr("Websuche aus", "Web search off"),
+        ]
+        if cfg.get("extended_thinking"):
+            options.append("Extended Thinking")
+        if cfg.get("short_answer"):
+            options.append(tr("Kurzantwort-Modus", "Short-answer mode"))
+        st.markdown(tr("**Optionen:** ", "**Options:** ") + " · ".join(options))
 
     st.divider()
 
@@ -4065,8 +3905,6 @@ def render_step5():
         col_frage    = tr("Frage", "Question")
         col_modell   = tr("Modell", "Model")
         col_antwort  = tr("Antwort", "Answer")
-        col_tok_in   = tr("Tok. Input", "Tok. input")
-        col_tok_out  = tr("Tok. Antwort", "Tok. answer")
         col_tok_an   = tr("Tok. Analyse", "Tok. analysis")
         col_api_ok   = tr("API OK", "API OK")
         raw_rows = []
@@ -4078,33 +3916,17 @@ def render_step5():
                 col_modell:   r.get("model", ""),
                 col_antwort:  (answer[:200] + "...") if len(answer) > 200 else answer,
                 "Brands":     ", ".join(b["brand"] for b in r.get("brands_found", [])),
-                col_tok_in:   r.get("tokens_in", 0),
-                col_tok_out:  r.get("tokens_out", 0),
                 col_tok_an:   r.get("tokens_analysis", 0),
                 col_api_ok:   "✅" if answer else "❌",
             })
         st.dataframe(
             pd.DataFrame(raw_rows),
             column_config={
-                col_tok_in: st.column_config.NumberColumn(
-                    col_tok_in,
-                    help=tr(
-                        "Prompt-Tokens: Größe des Eingabe-Textes (Systemprompt + Frage), den das Modell erhält.",
-                        "Prompt tokens: size of the input text (system prompt + question) the model receives.",
-                    ),
-                ),
-                col_tok_out: st.column_config.NumberColumn(
-                    col_tok_out,
-                    help=tr(
-                        "Completion-Tokens: Tokens der generierten Antwort in Phase 1. Bei Reasoning-Modellen schließt das interne Denkschritte ein.",
-                        "Completion tokens: tokens of the generated answer in Phase 1. For reasoning models this includes internal thinking steps.",
-                    ),
-                ),
                 col_tok_an: st.column_config.NumberColumn(
                     col_tok_an,
                     help=tr(
-                        "Completion-Tokens der Markenanalyse (Phase 2), summiert über alle Chunks dieser Frage.",
-                        "Completion tokens of the brand analysis (Phase 2), summed across all chunks for this question.",
+                        "Output-Tokens der gesamten Markenanalyse (Phase 2, alle Batches) — in jeder Zeile derselbe Wert.",
+                        "Output tokens of the whole brand analysis (Phase 2, all batches) — the same value in every row.",
                     ),
                 ),
             },
