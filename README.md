@@ -173,7 +173,7 @@ Die Kostenformel wird live angezeigt:
 
 Bewusst als Zwischenstopp eingebaut: Die teuren Sammel-Calls sind bezahlt, die Analyse-Calls noch nicht. Hier sehen Sie:
 - Wie viele Antworten gesammelt wurden, wie viele fehlschlugen.
-- **Wurde die Websuche tatsächlich genutzt?** — mit drei Belegarten (Details: [Code-Erklärung 2.14](docs/CODE.md)). Die Spalte „🔍 Websuche erfolgreich · Quellen" zeigt das je Antwort samt Anzahl der gelieferten Quellen.
+- **Wurde die Websuche tatsächlich genutzt?** — mit drei Belegarten (Details: [Code-Erklärung 2.13](docs/CODE.md)). Die Spalte „🔍 Websuche erfolgreich · Quellen" zeigt das je Antwort samt Anzahl der gelieferten Quellen.
 - Alle Antworten im Volltext, inklusive der zitierten Quellen.
 - Export als CSV oder JSON — **auch ohne Analyse**.
 
@@ -256,7 +256,7 @@ Der häufigste Fehlerherd überhaupt.
 |---|---|---|
 | **Widersprüchliche Server** | Dasselbe Modell schlägt sporadisch mit „is not available" fehl | Das Tool wiederholt bereits automatisch bis zu 4×. Bei anhaltendem Fehler: 🔄 Liste neu laden |
 | **Deployment-IDs ändern sich** | Ein früher funktionierendes Modell verschwindet | Neu laden, neu auswählen. Nichts ist fest im Code hinterlegt |
-| **Opus-Liste nicht abrufbar** | Schritt 3 zeigt „Standardmodell wird verwendet", Phase 2 schlägt evtl. fehl | Das neueste Opus wird live vom Anthropic-Endpoint gelesen. Klappt das nicht, greift `ANALYSIS_MODEL_FALLBACK` (Zeile 206) — bei Bedarf dort anpassen |
+| **Opus-Liste nicht abrufbar** | Schritt 3 zeigt „Standardmodell wird verwendet", Phase 2 schlägt evtl. fehl | Das neueste Opus wird live vom Anthropic-Endpoint gelesen. Klappt das nicht, greift `ANALYSIS_MODEL_FALLBACK` (Zeile 187) — bei Bedarf dort anpassen |
 | **Freitext-Modellfeld** | Bei fehlender Modellliste muss man den Namen exakt kennen | Erst API-Key prüfen, dann Verbindungstest |
 
 ### Rate Limits und Zeitverhalten
@@ -275,7 +275,7 @@ Das sind die Punkte, die man kennen **muss**, bevor man Ergebnisse präsentiert.
 | Problem | Erklärung | Gegenmaßnahme |
 |---|---|---|
 | **Die Websuche ist nicht erzwingbar** | `capabilities.webSearch` stellt das Werkzeug nur bereit. Kleinere Modelle nutzen es trotz ausdrücklicher Anweisung manchmal nicht. | Die Prüfung in Schritt 4 ernst nehmen. Bei roter Meldung: stärkeres Modell wählen. |
-| **Antworten werden für die Analyse auf 2.000 Zeichen gekürzt** | 70 % Anfang + 30 % Ende. Marken **in der Mitte** langer Antworten können übersehen werden. | `ANALYSIS_ANSWER_CHARS` erhöhen (Zeile 208) oder Kurzantwort-Modus nutzen. |
+| **Antworten werden für die Analyse auf 2.000 Zeichen gekürzt** | 70 % Anfang + 30 % Ende. Marken **in der Mitte** langer Antworten können übersehen werden. | `ANALYSIS_ANSWER_CHARS` erhöhen (Zeile 189) oder Kurzantwort-Modus nutzen. |
 | **Das Sentiment ist ein KI-Urteil** | Ein Modell entscheidet über positiv/neutral/negativ. Das ist nicht objektiv und nicht perfekt reproduzierbar — auch wenn Temperatur 0 hilft. | Konfidenz-Filter nutzen, Belegzitate stichprobenartig prüfen. |
 | **Fuzzy-Markenabgleich kann falsch treffen** | Teilstring-Suche in beide Richtungen ab 3 Zeichen: „Apple" trifft auch „Applebee's". | Bei kurzen/generischen Markennamen die Rohdaten kontrollieren. |
 | **Temperatur 0.7 erzeugt Streuung** | Absicht — sonst wären Wiederholungen wertlos. Aber: Zwei Läufe mit gleicher Konfiguration liefern **nicht** dieselben Zahlen. | Für Vergleiche über die Zeit immer dieselbe Konfiguration und ausreichend viele Runs verwenden. |
@@ -291,11 +291,9 @@ Das sind die Punkte, die man kennen **muss**, bevor man Ergebnisse präsentiert.
 |---|---|
 | **Globale Sperren gelten prozessweit, nicht pro Sitzung** | `_dead_models`, `_run_abort_reason` und `_TEMPERATURE_UNSUPPORTED` sind normale Modulvariablen. Wenn mehrere Personen **dieselbe** Streamlit-Instanz benutzen, teilen sie sich diese Zustände. Wenn bei Person A ein Budgetlimit greift, kann das auch Person B ausbremsen. **Das Tool ist für den Einzelplatzbetrieb gedacht.** |
 | **Keine Zugangsbeschränkung** | Streamlit hat von Haus aus keine Anmeldung. Wer die Adresse kennt, kann die App benutzen. Für eine Bereitstellung im Netzwerk muss ein vorgeschalteter Schutz eingerichtet werden. |
-| **Die Logdatei wächst unbegrenzt** | Keine Rotation. Bereits 2,1 MB im Repository-Stand. Regelmäßig aufräumen. |
-| **`support_evidence.jsonl` wächst ebenfalls** | Und enthält vollständige Anfrageinhalte. |
+| **Die Logdatei wächst unbegrenzt** | Keine Rotation. Regelmäßig aufräumen. |
 | **Python 3.10 ist Mindestvoraussetzung** | Wegen der Schreibweise `str \| None`. Ältere Versionen starten nicht. |
 | **Bei über ~40 Marken wird der Sentiment-Tab unlesbar** | Eine Bildschirmspalte je Marke. |
-| **Eine lokale Variable heißt wie eine globale** | In `render_step4` (Zeile 3238) heißt eine Hilfsvariable `evidence` — genau wie der globale `EvidenceRecorder` aus Zeile 60. Innerhalb dieser Funktion überdeckt sie ihn. Das ist funktional unbedenklich (der Recorder wird dort nicht benutzt), beim Lesen aber verwirrend. |
 
 ### Was das Tool bewusst **nicht** kann
 
@@ -337,16 +335,16 @@ Alle vier Versuche sind gescheitert. Das Modell wurde für diesen Lauf stillgele
 Die Notbremse hat gegriffen — meist ein erreichtes Budget-/Ausgabelimit des Workspace. Weitere Versuche würden nichts bringen. **Die bis dahin gesammelten Antworten bleiben erhalten** und können in Schritt 4 exportiert oder analysiert werden. Zuerst das Limit in Langdock prüfen.
 
 ### „Token-Budget erschöpft (max_tokens=…)."
-Kann nur noch in der Analyse auftreten (die Sammlung läuft über die Agent-API, die kein Token-Limit kennt). `DATASET_ANALYSIS_MAX_TOKENS` (Zeile 207) erhöhen oder `ANALYSIS_BATCH_MAX_ANSWERS` senken.
+Kann nur noch in der Analyse auftreten (die Sammlung läuft über die Agent-API, die kein Token-Limit kennt). `DATASET_ANALYSIS_MAX_TOKENS` (Zeile 188) erhöhen oder `ANALYSIS_BATCH_MAX_ANSWERS` senken.
 
 ### „Timeout nach 180s." / „Timeout nach 240s."
-Das Modell hat zu lange gebraucht. Mögliche Ursachen: hohe Last, sehr aufwendige Websuche, sehr langer Prompt. Weniger parallele Aufrufe einstellen oder in Zeile 196/197 höher setzen.
+Das Modell hat zu lange gebraucht. Mögliche Ursachen: hohe Last, sehr aufwendige Websuche, sehr langer Prompt. Weniger parallele Aufrufe einstellen oder in Zeile 177/178 höher setzen.
 
 ### „Es konnten keine Fragen aus der Antwort extrahiert werden."
 Das Modell hat auf die Aufforderung nach einem JSON-Array mit Prosa geantwortet. Ein anderes Modell probieren, oder in Schritt 2 auf eigene Fragen umstellen. Im Log steht unter `PARSED ZERO` der Anfang der tatsächlichen Antwort.
 
 ### „Ein Analyse-Batch konnte nicht als JSON gelesen werden (evtl. abgeschnitten)."
-Die JSON-Ausgabe des Analyse-Modells wurde vermutlich abgeschnitten. `ANALYSIS_BATCH_MAX_ANSWERS` (Zeile 359) auf z. B. 25 senken und über den Button in Schritt 5 neu analysieren — das kostet keine neuen Sammel-Aufrufe.
+Die JSON-Ausgabe des Analyse-Modells wurde vermutlich abgeschnitten. `ANALYSIS_BATCH_MAX_ANSWERS` (Zeile 340) auf z. B. 25 senken und über den Button in Schritt 5 neu analysieren — das kostet keine neuen Sammel-Aufrufe.
 
 ### „🔍 Keine Antwort hat das Such-Tool nachweislich genutzt."
 Die Modelle haben aus ihrem Trainingswissen geantwortet. Ein stärkeres Modell wählen (kleine Modelle ignorieren die Suchanweisung häufiger) und prüfen, ob die Websuche in Schritt 3 wirklich aktiv war. Bei zeitlosen Fragen ist es kein Fehler — dort ist Suchen tatsächlich unnötig.
@@ -363,7 +361,7 @@ tail -f brand_visibility.log
 Steht dort `Rate limited (429), waiting …`, arbeitet das Tool und wartet nur eine Sperre ab. Es gibt keine Anzeige dafür in der Oberfläche — das ist ein bekannter Schwachpunkt.
 
 ### Jede Logzeile steht mehrfach in der Datei
-Sollte durch den Schutz in Zeile 39 nicht passieren. Falls doch: Streamlit vollständig beenden und neu starten.
+Sollte durch den Schutz in Zeile 38 nicht passieren. Falls doch: Streamlit vollständig beenden und neu starten.
 
 ---
 
@@ -374,8 +372,6 @@ Sollte durch den Schutz in Zeile 39 nicht passieren. Falls doch: Streamlit volls
 **Was das Script richtig macht:**
 - Der Key wird über ein Passwortfeld eingegeben (`type="password"`) und ist damit nicht im Klartext sichtbar.
 - Er wird **nie** in `brand_visibility.log` geschrieben.
-- In `support_evidence.jsonl` steht nur ein Hash-Fingerabdruck.
-- Sollte der Key jemals in einer Fehlerantwort zurückgespiegelt werden, ersetzt ihn `redact()` durch `<REDACTED_API_KEY>`.
 - `key.txt` ist in `.gitignore` gesperrt, mit einem ausdrücklichen Kommentar: *„API key — never commit"*.
 
 **Worauf Sie trotzdem achten müssen:**
@@ -388,17 +384,13 @@ Sollte durch den Schutz in Zeile 39 nicht passieren. Falls doch: Streamlit volls
 | Datei | Enthält | Risiko |
 |---|---|---|
 | `brand_visibility.log` | Statuscodes, Modellnamen, Zeiten, gekürzte Fehlermeldungen | Gering — kein Key, keine vollen Prompts |
-| `support_evidence.jsonl` | **Vollständige Anfrageinhalte inklusive aller Prompts und Fragen**, ungekürzte Fehlerantworten, Antwort-Header | ⚠️ **Erhöht** — vor Weitergabe hineinschauen |
 | `results/*.csv` | Fragen, Antworten (auf 500 Zeichen gekürzt), Markenzuordnungen | Abhängig vom Thema |
-
-Der Code weist an Zeile 1151 selbst darauf hin:
-> *„…und es ENTHÄLT DEN PROMPT-TEXT — einen Blick wert, bevor diese Datei nach außen gegeben wird."*
 
 ### Was an Langdock übertragen wird
 
 Jede Frage, jeder Prompt und jede Marke, die Sie eingeben, geht an Langdock und von dort an den jeweiligen KI-Anbieter. Bei aktiver Websuche werden zusätzlich Suchanfragen an eine Suchmaschine gestellt.
 
-**Praktische Konsequenz:** Keine vertraulichen Produktnamen, unveröffentlichten Projektbezeichnungen oder personenbezogenen Daten in die Fragen schreiben. Die Region `eu` sorgt für EU-Verarbeitung beim Analyse-Endpoint — **die Agent-API, über die alle Fragen gestellt werden, hat allerdings keine Region in der Adresse** (Zeile 188). Wo genau sie verarbeitet, sollte bei Bedarf mit Langdock geklärt werden.
+**Praktische Konsequenz:** Keine vertraulichen Produktnamen, unveröffentlichten Projektbezeichnungen oder personenbezogenen Daten in die Fragen schreiben. Die Region `eu` sorgt für EU-Verarbeitung beim Analyse-Endpoint — **die Agent-API, über die alle Fragen gestellt werden, hat allerdings keine Region in der Adresse** (Zeile 169). Wo genau sie verarbeitet, sollte bei Bedarf mit Langdock geklärt werden.
 
 ### Betrieb im Netzwerk
 
@@ -412,26 +404,26 @@ Alle wichtigen Werte stehen als Konstanten am Anfang der Datei. Zum Anpassen gen
 
 | Was | Zeile | Standard | Wirkung beim Ändern |
 |---|---|---|---|
-| `LANGDOCK_REGION` | 182 | `eu` | Umgebungsvariable beim Start, nicht im Code ändern |
-| `REQUEST_TIMEOUT` | 196 | 180 s | Höher, wenn Analyse-Calls regelmäßig in den Timeout laufen |
-| `AGENT_STREAM_TIMEOUT` | 197 | 240 s | Höher bei sehr aufwendigen Suchen |
-| `MAX_TOKENS` | 198 | 8000 | Standardbudget für Passthrough-Calls |
-| `QUESTION_MAX_TOKENS` | 199 | 16000 | Wird nur protokolliert — die Agent-API kennt kein Token-Limit |
-| **`ANALYSIS_MODEL_FALLBACK`** | **206** | `claude-opus-4-8` | Nur wenn das neueste Opus nicht live ermittelt werden kann (`resolve_analysis_model`) |
-| `DATASET_ANALYSIS_MAX_TOKENS` | 207 | 16000 | Ausgabebudget je Analyse-Batch |
-| `ANALYSIS_ANSWER_CHARS` | 208 | 2000 | Höher = weniger Kürzung, mehr Kosten |
-| `COLLECTION_TEMPERATURE` | 216 | 0.7 | Niedriger = einheitlichere Antworten (Wiederholungen verlieren an Wert) |
-| `QUESTION_TEMPERATURE` | 217 | 0.8 | Niedriger = konventionellere Fragen |
-| `ANALYSIS_TEMPERATURE` | 218 | 0.0 | Nicht erhöhen — Reproduzierbarkeit geht verloren |
-| `_FATAL_LIMIT_RE` | 296 | siehe Code | Suchmuster für endgültige Limits. Erweitern nur mit Bedacht |
-| `ANALYSIS_BATCH_MAX_ANSWERS` | 359 | 40 | Kleiner = mehr Aufrufe, geringeres Abschneide-Risiko |
-| `ANALYSIS_BATCH_MAX_INPUT_TOKENS` | 360 | 40000 | Eingabegrenze je Batch |
-| `ANALYSIS_ANSWER_HEAD_FRAC` | 364 | 0.7 | Verhältnis Anfang/Ende bei der Kürzung |
-| `AGENT_MODELS_TTL` | 522 | 60 s | Wie lange die Modellliste zwischengespeichert wird |
-| Agent-`instructions` | 1102 | siehe Code | Der Text, der das Modell zum Suchen bewegt |
-| Prompts der Fragengenerierung | 1431 | siehe Code | Welche Art Fragen erzeugt wird |
-| Prompts der Antwortsammlung | 1531 | siehe Code | **Nur mit Bedacht ändern** — beeinflusst das Messergebnis direkt |
-| Analyse-Prompt | 1753 | siehe Code | Welche Felder erkannt werden |
+| `LANGDOCK_REGION` | 163 | `eu` | Umgebungsvariable beim Start, nicht im Code ändern |
+| `REQUEST_TIMEOUT` | 177 | 180 s | Höher, wenn Analyse-Calls regelmäßig in den Timeout laufen |
+| `AGENT_STREAM_TIMEOUT` | 178 | 240 s | Höher bei sehr aufwendigen Suchen |
+| `MAX_TOKENS` | 179 | 8000 | Standardbudget für Passthrough-Calls |
+| `QUESTION_MAX_TOKENS` | 180 | 16000 | Wird nur protokolliert — die Agent-API kennt kein Token-Limit |
+| **`ANALYSIS_MODEL_FALLBACK`** | **187** | `claude-opus-4-8` | Nur wenn das neueste Opus nicht live ermittelt werden kann (`resolve_analysis_model`) |
+| `DATASET_ANALYSIS_MAX_TOKENS` | 188 | 16000 | Ausgabebudget je Analyse-Batch |
+| `ANALYSIS_ANSWER_CHARS` | 189 | 2000 | Höher = weniger Kürzung, mehr Kosten |
+| `COLLECTION_TEMPERATURE` | 197 | 0.7 | Niedriger = einheitlichere Antworten (Wiederholungen verlieren an Wert) |
+| `QUESTION_TEMPERATURE` | 198 | 0.8 | Niedriger = konventionellere Fragen |
+| `ANALYSIS_TEMPERATURE` | 199 | 0.0 | Nicht erhöhen — Reproduzierbarkeit geht verloren |
+| `_FATAL_LIMIT_RE` | 277 | siehe Code | Suchmuster für endgültige Limits. Erweitern nur mit Bedacht |
+| `ANALYSIS_BATCH_MAX_ANSWERS` | 340 | 40 | Kleiner = mehr Aufrufe, geringeres Abschneide-Risiko |
+| `ANALYSIS_BATCH_MAX_INPUT_TOKENS` | 341 | 40000 | Eingabegrenze je Batch |
+| `ANALYSIS_ANSWER_HEAD_FRAC` | 345 | 0.7 | Verhältnis Anfang/Ende bei der Kürzung |
+| `AGENT_MODELS_TTL` | 503 | 60 s | Wie lange die Modellliste zwischengespeichert wird |
+| Agent-`instructions` | 1068 | siehe Code | Der Text, der das Modell zum Suchen bewegt |
+| Prompts der Fragengenerierung (`generate_questions`) | 1376 | siehe Code | Welche Art Fragen erzeugt wird |
+| Prompts der Antwortsammlung (`ask_question`) | 1473 | siehe Code | **Nur mit Bedacht ändern** — beeinflusst das Messergebnis direkt |
+| Analyse-Prompt (`_build_analysis_prompt`) | 1704 | siehe Code | Welche Felder erkannt werden |
 
 ---
 
@@ -442,14 +434,14 @@ Damit diese Datei schlank bleibt, liegen die ausführlichen Teile in eigenen Dok
 | Dokument | Inhalt | Für wen |
 |---|---|---|
 | **[📖 Glossar](docs/GLOSSAR.md)** | Rund 35 Fachbegriffe alltagssprachlich erklärt — LLM, Token, Temperatur, Rate Limit, Streaming, Session State, Share of Voice … | Alle, die beim Lesen über einen Begriff stolpern |
-| **[🔧 Code-Erklärung](docs/CODE.md)** | `app.py` Abschnitt für Abschnitt: was der Code tut, warum er so gebaut ist, welche Erfahrungen dahinterstecken. Mit Landkarte, Datenfluss-Diagramm und Anhang zu `langdock_evidence.py` | Wer das Tool anpassen, erweitern oder tiefer verstehen will |
+| **[🔧 Code-Erklärung](docs/CODE.md)** | `app.py` Abschnitt für Abschnitt: was der Code tut, warum er so gebaut ist, welche Erfahrungen dahinterstecken. Mit Landkarte und Datenfluss-Diagramm | Wer das Tool anpassen, erweitern oder tiefer verstehen will |
 
 **Direkt zu den wichtigsten Code-Abschnitten:**
 
-- [Die zwei Modellkataloge](docs/CODE.md#212-die-zwei-modellkataloge--das-komplizierteste-thema-im-script) — die häufigste Fehlerquelle im Betrieb
-- [`call_langdock()` — das Herzstück](docs/CODE.md#213-call_langdock--das-herzstück) — jede API-Anfrage läuft hier durch
-- [`call_langdock_agent()` — der Websuche-Weg](docs/CODE.md#214-call_langdock_agent--der-websuche-weg)
-- [Phase 1 — der Sammellauf](docs/CODE.md#228-phase-1--der-sammellauf)
+- [Die zwei Modellkataloge](docs/CODE.md#211-die-zwei-modellkataloge--das-komplizierteste-thema-im-script) — die häufigste Fehlerquelle im Betrieb
+- [`call_langdock()` — das Herzstück](docs/CODE.md#212-call_langdock--das-herzstück) — jede API-Anfrage läuft hier durch
+- [`call_langdock_agent()` — der Websuche-Weg](docs/CODE.md#213-call_langdock_agent--der-websuche-weg)
+- [Phase 1 — der Sammellauf](docs/CODE.md#227-phase-1--der-sammellauf)
 
 ---
 
@@ -457,14 +449,11 @@ Damit diese Datei schlank bleibt, liegen die ausführlichen Teile in eigenen Dok
 
 | Datei / Ordner | Inhalt | Im Git? |
 |---|---|---|
-| `app.py` | Die komplette Anwendung — Oberfläche, API-Anbindung, Analyse (~4.100 Zeilen) | ✅ |
-| `langdock_evidence.py` | Protokolliert Agent-API-Anfragen für Langdock-Support-Tickets | ✅ |
+| `app.py` | Die komplette Anwendung — Oberfläche, API-Anbindung, Analyse (~4.050 Zeilen) | ✅ |
 | `requirements.txt` | Die vier benötigten Bibliotheken | ✅ |
 | `docs/GLOSSAR.md` | Begriffserklärungen | ✅ |
 | `docs/CODE.md` | Ausführliche Code-Erklärung | ✅ |
-| `support/` | Standalone-Reproduktionsscript und Support-Korrespondenz | ✅ |
 | `brand_visibility.log` | Technisches Protokoll jedes API-Aufrufs | ❌ |
-| `support_evidence.jsonl` | Vollständige Mitschriften der Agent-API-Aufrufe | ❌ |
 | `results/` | Lokal gespeicherte CSV-Exporte | ❌ |
 | `key.txt` | Falls Sie den API-Key dort ablegen — **bewusst gesperrt** | ❌ |
 
@@ -486,4 +475,4 @@ Für den ersten Lauf:
 
 ---
 
-*Stand: 10.09.2026 · Bezieht sich auf `app.py` mit 4.280 Zeilen*
+*Stand: 17.09.2026 · Bezieht sich auf `app.py` mit 4.054 Zeilen*

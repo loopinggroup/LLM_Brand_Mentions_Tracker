@@ -1,7 +1,6 @@
 """
 LLM Brand Visibility — Streamlit App (Langdock Edition)
 =========================================================
-Based on brand_monitor.py and analyze_csv.py.
 Uses the Langdock API directly via requests (no OpenAI SDK needed).
 
 Installation:
@@ -12,6 +11,7 @@ Start:
 """
 
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -27,8 +27,6 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-from langdock_evidence import EvidenceRecorder, key_fingerprint, redact, response_headers
-
 # ---------------------------------------------------------------------------
 # Logging
 # Uses a guard to prevent duplicate handlers when Streamlit reruns the script.
@@ -41,23 +39,6 @@ if not log.handlers:
     _fh = logging.FileHandler("brand_visibility.log")
     _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     log.addHandler(_fh)
-
-# ---------------------------------------------------------------------------
-# Support evidence
-#
-# brand_visibility.log is written for US: it summarises. Langdock support needs the
-# opposite — the full GET /agent/v1/models response, the exact POST body, and the
-# UNMODIFIED response body, all from one run and provably one key. None of that
-# survives the normal log (the GET response is parsed and dropped, the POST body is
-# never written, error bodies pass through _strip_html() at 600 chars), so the Agent
-# API calls additionally write raw transcripts here.
-#
-# Append-only, one JSON object per request, no API key — only key_fingerprint(). Cheap
-# enough to leave on permanently, and it means the next support ticket can be answered
-# from real production traffic instead of a fresh reproduction run.
-# See support/langdock_repro.py for the standalone version and the report generator.
-# ---------------------------------------------------------------------------
-evidence = EvidenceRecorder("support_evidence.jsonl")
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -520,11 +501,6 @@ def _probe_models(url: str, api_key: str, payload: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 AGENT_MODELS_TTL = 60
 
-# `seq` of the most recent recorded GET /agent/v1/models. Every recorded POST carries it
-# so support can tie a rejected model ID back to the exact catalog response that supplied
-# it — which is precisely the pairing they asked for.
-_last_catalog_seq: int | None = None
-
 
 @st.cache_data(ttl=AGENT_MODELS_TTL, show_spinner=False)
 def fetch_agent_models(api_key: str) -> tuple[list[dict], str | None]:
@@ -532,7 +508,6 @@ def fetch_agent_models(api_key: str) -> tuple[list[dict], str | None]:
     Returns ([{id, region, supportsExtendedThinking}, ...], error).
     IDs are returned verbatim — they are what must be sent as the model value.
     """
-    global _last_catalog_seq
     if not api_key:
         return [], None
     try:
@@ -541,15 +516,6 @@ def fetch_agent_models(api_key: str) -> tuple[list[dict], str | None]:
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=15,
         )
-        # Recorded BEFORE raise_for_status so a failed catalog fetch is captured too.
-        _last_catalog_seq = evidence.record(
-            "GET /agent/v1/models",
-            url=AGENT_MODELS_URL,
-            key_fingerprint=key_fingerprint(api_key),
-            http_status=r.status_code,
-            response_headers=response_headers(r),
-            response_body_raw=redact(r.text, api_key),
-        )["seq"]
         r.raise_for_status()
         models = [
             {
@@ -1142,26 +1108,6 @@ def call_langdock_agent(
                 timeout=AGENT_STREAM_TIMEOUT,
                 stream=True,
             ) as r:
-                # Support evidence: the exact body sent, the status, and — for errors —
-                # the unmodified response body, tied to the GET that supplied `model`.
-                # The body is only read on an error: touching r.text on a 2xx would
-                # consume the stream the parser below depends on, and a full answer
-                # stream is not what the ticket is about. The request body is snapshotted
-                # (it is mutated between attempts) and it CONTAINS THE PROMPT TEXT — worth
-                # a look before this file is passed to anyone outside.
-                evidence.record(
-                    "POST /agent/v1/chat/completions",
-                    url=AGENT_URL,
-                    key_fingerprint=key_fingerprint(api_key),
-                    model_requested=model,
-                    from_catalog_seq=_last_catalog_seq,
-                    attempt=attempt + 1,
-                    request_body=json.loads(json.dumps(payload)),
-                    http_status=r.status_code,
-                    response_headers=response_headers(r),
-                    response_body_raw=(redact(r.text, api_key) if r.status_code >= 400 else None),
-                )
-
                 # Check the status code before touching the body — reading
                 # e.response.text *after* the `with` block has closed the
                 # connection (as happens if we let raise_for_status() raise
@@ -1364,6 +1310,11 @@ def call_langdock_agent(
 # Makes a minimal API call to verify credentials and model name.
 # Shown in Step 1 so problems are caught before a long run starts.
 # ---------------------------------------------------------------------------
+def _key_id(api_key: str) -> str:
+    """Short hash of the API key, so test results can be tied to a key without storing it twice."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+
 def test_connections(api_key: str, models: list[str]) -> dict[str, tuple[bool, str]]:
     """
     One minimal Agent-API call per selected model, in parallel, to verify the key and
@@ -2287,14 +2238,14 @@ def render_step1():
         if st.button("🔌 " + tr("Verbindung testen", "Test connection"), disabled=not (api_key and models)):
             with st.spinner(tr(f"Teste {len(models)} Modell(e)...", f"Testing {len(models)} model(s)...")):
                 st.session_state.conn_test = {
-                    "key":     key_fingerprint(api_key),
+                    "key":     _key_id(api_key),
                     "results": test_connections(api_key, models),
                 }
 
         # Results are kept in session state so they are still visible after coming
         # back from a later step — but only for the key they were produced with.
         test = st.session_state.get("conn_test") or {}
-        if api_key and test.get("key") == key_fingerprint(api_key):
+        if api_key and test.get("key") == _key_id(api_key):
             results = test.get("results", {})
             tested  = [(m, results[m]) for m in models if m in results]
             for m, (ok, msg) in tested:

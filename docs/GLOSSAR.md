@@ -19,7 +19,7 @@ Diese Begriffe tauchen in der Doku und im Code laufend auf. Sie können den Absc
 Ein „großes Sprachmodell" — die Technik hinter ChatGPT, Claude, Gemini. Ein Programm, das auf riesigen Textmengen trainiert wurde und darauf spezialisiert ist, Text fortzusetzen. Wenn Sie ihm eine Frage stellen, „errät" es die passendste Antwort. Beispiele im Tool: `gpt-5-mini`, `claude-opus-4-8`, `gemini-…`.
 
 **Modell / Modell-ID**
-Die konkrete Version eines LLM, angesprochen über einen technischen Namen wie `claude-opus-4-8` oder `gpt-5-mini-eu`. Dieser Name muss **exakt** stimmen — ein Tippfehler führt zu einer Fehlermeldung. Das ist im Code ein großes Thema (siehe [Code-Erklärung 2.12](CODE.md#212-die-zwei-modellkataloge--das-komplizierteste-thema-im-script)).
+Die konkrete Version eines LLM, angesprochen über einen technischen Namen wie `claude-opus-4-8` oder `gpt-5-mini-eu`. Dieser Name muss **exakt** stimmen — ein Tippfehler führt zu einer Fehlermeldung. Das ist im Code ein großes Thema (siehe [Code-Erklärung 2.11](CODE.md#211-die-zwei-modellkataloge--das-komplizierteste-thema-im-script)).
 
 **Prompt**
 Der Text, den man dem Modell schickt — Frage plus Anweisungen. Beispiel aus dem Code:
@@ -92,7 +92,7 @@ Ein Textformat zum Austausch strukturierter Daten. Sieht so aus:
 ```json
 {"brand": "Nike", "sentiment": "positive", "rank": 1}
 ```
-Das Tool bittet die KI ausdrücklich um JSON, damit die Antwort maschinell auswertbar ist. **Problem:** KI-Modelle halten sich nicht immer daran — deshalb gibt es im Code aufwendige „Reparatur-Parser" ([Code-Erklärung 2.19](CODE.md#219-die-json-reparatur)).
+Das Tool bittet die KI ausdrücklich um JSON, damit die Antwort maschinell auswertbar ist. **Problem:** KI-Modelle halten sich nicht immer daran — deshalb gibt es im Code aufwendige „Reparatur-Parser" ([Code-Erklärung 2.18](CODE.md#218-die-json-reparatur)).
 
 **Parsen**
 Das Zerlegen und Interpretieren von Text durch ein Programm. „JSON parsen" = aus dem Text `{"brand": "Nike"}` eine nutzbare Datenstruktur machen. Schlägt das fehl, spricht man von einem *Parse-Fehler*.

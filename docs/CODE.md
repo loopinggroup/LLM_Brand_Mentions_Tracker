@@ -17,28 +17,26 @@
 
 | | Abschnitt | | Abschnitt |
 |---|---|---|---|
-| [2.1](#21-kopf-und-imports) | Kopf und Imports | [2.17](#217-eine-frage-stellen) | Eine Frage stellen |
-| [2.2](#22-logging) | Logging | [2.18](#218-textwerkzeuge) | Textwerkzeuge |
-| [2.3](#23-support-protokoll) | Support-Protokoll | [2.19](#219-die-json-reparatur) | Die JSON-Reparatur |
-| [2.4](#24-seitenkonfiguration) | Seitenkonfiguration | [2.20](#220-die-markenanalyse--phase-2-im-detail) | Die Markenanalyse — Phase 2 im Detail |
-| [2.5](#25-das-gedächtnis-session-state) | Das Gedächtnis: Session State | [2.21](#221-ergebnisse-in-eine-tabelle-bringen) | Ergebnisse in eine Tabelle bringen |
-| [2.6](#26-zweisprachigkeit) | Zweisprachigkeit | [2.22](#222-markenerkennung-ohne-ki) | Markenerkennung ohne KI |
-| [2.7](#27-api-adressen-und-grundeinstellungen) | API-Adressen und Grundeinstellungen | [2.23](#223-export) | Export |
-| [2.8](#28-umgang-mit-modell-akzeptiert-keine-temperatur) | Umgang mit „Modell akzeptiert keine Temperatur" | [2.24](#224-die-tutorials) | Die Tutorials |
-| [2.9](#29-tote-modelle) | Tote Modelle | [2.25](#225-oberfläche-schritt-1) | Oberfläche Schritt 1 |
-| [2.10](#210-die-notbremse-circuit-breaker) | Die Notbremse („Circuit Breaker") | [2.26](#226-oberfläche-schritt-2) | Oberfläche Schritt 2 |
-| [2.11](#211-batch-einstellungen-für-die-analyse) | Batch-Einstellungen für die Analyse | [2.27](#227-oberfläche-schritt-3) | Oberfläche Schritt 3 |
-| [2.12](#212-die-zwei-modellkataloge--das-komplizierteste-thema-im-script) | Die zwei Modellkataloge — das komplizierteste Thema im Script | [2.28](#228-phase-1--der-sammellauf) | Phase 1 — der Sammellauf |
-| [2.13](#213-call_langdock--das-herzstück) | `call_langdock()` — das Herzstück | [2.29](#229-phase-2--die-analyse) | Phase 2 — die Analyse |
-| [2.14](#214-call_langdock_agent--der-websuche-weg) | `call_langdock_agent()` — der Websuche-Weg | [2.30](#230-oberfläche-schritt-4--rohdaten) | Oberfläche Schritt 4 — Rohdaten |
-| [2.15](#215-verbindungstest) | Verbindungstest | [2.31](#231-oberfläche-schritt-5--ergebnisse) | Oberfläche Schritt 5 — Ergebnisse |
-| [2.16](#216-fragen-generieren) | Fragen generieren | [2.32](#232-der-router) | Der Router |
+| [2.1](#21-kopf-und-imports) | Kopf und Imports | [2.17](#217-textwerkzeuge) | Textwerkzeuge |
+| [2.2](#22-logging) | Logging | [2.18](#218-die-json-reparatur) | Die JSON-Reparatur |
+| [2.3](#23-seitenkonfiguration) | Seitenkonfiguration | [2.19](#219-die-markenanalyse--phase-2-im-detail) | Die Markenanalyse — Phase 2 im Detail |
+| [2.4](#24-das-gedächtnis-session-state) | Das Gedächtnis: Session State | [2.20](#220-ergebnisse-in-eine-tabelle-bringen) | Ergebnisse in eine Tabelle bringen |
+| [2.5](#25-zweisprachigkeit) | Zweisprachigkeit | [2.21](#221-markenerkennung-ohne-ki) | Markenerkennung ohne KI |
+| [2.6](#26-api-adressen-und-grundeinstellungen) | API-Adressen und Grundeinstellungen | [2.22](#222-export) | Export |
+| [2.7](#27-umgang-mit-modell-akzeptiert-keine-temperatur) | Umgang mit „Modell akzeptiert keine Temperatur" | [2.23](#223-die-tutorials) | Die Tutorials |
+| [2.8](#28-tote-modelle) | Tote Modelle | [2.24](#224-oberfläche-schritt-1) | Oberfläche Schritt 1 |
+| [2.9](#29-die-notbremse-circuit-breaker) | Die Notbremse („Circuit Breaker") | [2.25](#225-oberfläche-schritt-2) | Oberfläche Schritt 2 |
+| [2.10](#210-batch-einstellungen-für-die-analyse) | Batch-Einstellungen für die Analyse | [2.26](#226-oberfläche-schritt-3) | Oberfläche Schritt 3 |
+| [2.11](#211-die-zwei-modellkataloge--das-komplizierteste-thema-im-script) | Die zwei Modellkataloge — das komplizierteste Thema im Script | [2.27](#227-phase-1--der-sammellauf) | Phase 1 — der Sammellauf |
+| [2.12](#212-call_langdock--das-herzstück) | `call_langdock()` — das Herzstück | [2.28](#228-phase-2--die-analyse) | Phase 2 — die Analyse |
+| [2.13](#213-call_langdock_agent--der-websuche-weg) | `call_langdock_agent()` — der Websuche-Weg | [2.29](#229-oberfläche-schritt-4--rohdaten) | Oberfläche Schritt 4 — Rohdaten |
+| [2.14](#214-verbindungstest) | Verbindungstest | [2.30](#230-oberfläche-schritt-5--ergebnisse) | Oberfläche Schritt 5 — Ergebnisse |
+| [2.15](#215-fragen-generieren) | Fragen generieren | [2.31](#231-der-router) | Der Router |
+| [2.16](#216-eine-frage-stellen) | Eine Frage stellen | | |
 
 **[3. Der Datenfluss auf einen Blick](#3-der-datenfluss-auf-einen-blick)**
 
-**[4. Anhang: Die Nachbardatei `langdock_evidence.py`](#4-anhang-die-nachbardatei-langdock_evidencepy)**
-
-> **Wenn Sie wenig Zeit haben:** Die drei fett markierten Abschnitte 2.12, 2.13/2.14 und 2.28 enthalten den Kern des Programms und die meiste gesammelte Erfahrung.
+> **Wenn Sie wenig Zeit haben:** Die drei fett markierten Abschnitte 2.11, 2.12/2.13 und 2.27 enthalten den Kern des Programms und die meiste gesammelte Erfahrung.
 
 ---
 
@@ -57,7 +55,7 @@ Grobe Aufteilung:
 | Zeilen | Block | Was dort passiert |
 |---|---|---|
 | 1–30 | Kopf & Imports | Welche Bibliotheken werden geladen |
-| 32–60 | Logging & Support-Protokoll | Zwei getrennte Protokolldateien |
+| 32–42 | Logging | Die Protokolldatei `brand_visibility.log` |
 | 62–132 | Grundgerüst | Seitenlayout, Gedächtnis, Sprachumschaltung |
 | 134–330 | Konfiguration | API-Adressen, Zeitlimits, Temperaturen, Fehlerregeln |
 | 333–855 | Modellkataloge | Welche Modelle gibt es? Auswahl-Widgets |
@@ -104,13 +102,11 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-
-from langdock_evidence import EvidenceRecorder, key_fingerprint, redact, response_headers
 ```
 
 **Was ist ein Import?** Das Einbinden fertiger Werkzeugkästen, damit man das Rad nicht neu erfinden muss.
 
-Die erste Gruppe gehört zu Python selbst (CSV-Dateien schreiben, JSON verarbeiten, Protokoll führen, Umgebungsvariablen lesen, Zufallszahlen, Regex, Zeitmessung). Die zweite Gruppe sind die vier extern installierten Bibliotheken. Die letzte Zeile lädt Funktionen aus der **Nachbardatei `langdock_evidence.py`**, die im selben Ordner liegt.
+Die erste Gruppe gehört zu Python selbst (CSV-Dateien schreiben, JSON verarbeiten, Protokoll führen, Umgebungsvariablen lesen, Zufallszahlen, Regex, Zeitmessung). Die zweite Gruppe sind die vier extern installierten Bibliotheken.
 
 ### 2.2 Logging
 
@@ -136,35 +132,7 @@ Das ist die erste Anlaufstelle, wenn etwas schiefgeht.
 
 > **Fallstrick:** Die Logdatei wächst unbegrenzt. Im Repository lag sie bereits bei **2,1 MB**. Sie wird nie automatisch gekürzt oder rotiert. Bei intensiver Nutzung sollte man sie regelmäßig löschen oder archivieren.
 
-### 2.3 Support-Protokoll
-
-<sub>📍 Code: Zeilen 45–60 + Datei `langdock_evidence.py`</sub>
-
-```python
-evidence = EvidenceRecorder("support_evidence.jsonl")
-```
-
-Dies ist ein **zweites, ganz anders geartetes Protokoll**. Der Hintergrund ist eine reale Support-Geschichte:
-
-Die Langdock Agent-API lehnte gelegentlich Modelle ab, die sie im selben Moment noch selbst als verfügbar gemeldet hatte. Der Langdock-Support konnte damit nichts anfangen, weil er ein **exaktes, ungekürztes Paar** brauchte:
-1. die vollständige Antwort auf „Welche Modelle gibt es?" (`GET /agent/v1/models`),
-2. die unmittelbar danach gesendete Anfrage mit ihrem **exakten** Inhalt und der **unveränderten** Fehlerantwort,
-3. den Beweis, dass beides mit demselben Schlüssel passierte.
-
-Das normale Log liefert nichts davon: Es kürzt Fehlermeldungen auf 600 Zeichen, verwirft die Modellliste nach dem Auswerten und schreibt den Anfrageinhalt gar nicht auf.
-
-Deshalb schreibt `EvidenceRecorder` in eine **JSONL-Datei** (= eine JSON-Struktur pro Zeile) mit zwei eisernen Regeln:
-
-| Regel | Umsetzung |
-|---|---|
-| Der API-Key wird **niemals** geschrieben | Stattdessen ein `key_fingerprint`: `sha256:a1b2c3d4e5f6/…7h9k`. Der Hash beweist „selber Schlüssel", verrät ihn aber nicht. |
-| Antwortinhalte werden **wörtlich** übernommen | Kein Kürzen, kein Verschönern — genau das machte das alte Log unbrauchbar. |
-
-**Was ist ein Hash?** Eine Einwegberechnung: Aus dem Schlüssel wird eine feste Zeichenfolge. Derselbe Schlüssel ergibt immer denselben Hash, aber aus dem Hash lässt sich der Schlüssel nicht zurückrechnen.
-
-> ⚠️ **Datenschutz-Hinweis:** In `support_evidence.jsonl` landet der **komplette Anfrageinhalt** — also auch Ihre Fragen und Prompts. Der Code weist selbst darauf hin (Zeile 1210). Bevor Sie diese Datei an einen externen Support schicken: **hineinschauen**.
-
-### 2.4 Seitenkonfiguration
+### 2.3 Seitenkonfiguration
 
 <sub>📍 Code: Zeilen 62–69</sub>
 
@@ -174,7 +142,7 @@ st.set_page_config(page_title="LLM Brand Visibility", page_icon="📊", layout="
 
 Browser-Tab-Titel, Icon, und `layout="wide"` für die volle Bildschirmbreite — bei so vielen Diagrammen sinnvoll.
 
-### 2.5 Das Gedächtnis: Session State
+### 2.4 Das Gedächtnis: Session State
 
 <sub>📍 Code: Zeilen 71–103</sub>
 
@@ -225,7 +193,7 @@ Was worin steckt:
 
 > ⚠️ **Wichtig für Anwender:** Der Session State liegt nur im Arbeitsspeicher. **Browser-Tab schließen = alle Daten weg.** Es gibt kein Auto-Save. Deshalb: In Schritt 4 und 5 immer exportieren.
 
-### 2.6 Zweisprachigkeit
+### 2.5 Zweisprachigkeit
 
 <sub>📍 Code: Zeilen 105–132</sub>
 
@@ -244,7 +212,7 @@ Bewusst wurde **kein** zentrales Übersetzungslexikon verwendet. Vorteil: Man si
 
 Der Umschalter selbst (`render_language_switch`, Zeile 119) sitzt rechts oben, umgesetzt über zwei Spalten im Verhältnis 6:1 — die breite linke Spalte ist nur ein Platzhalter, der das Auswahlfeld nach rechts drückt.
 
-### 2.7 API-Adressen und Grundeinstellungen
+### 2.6 API-Adressen und Grundeinstellungen
 
 <sub>📍 Code: Zeilen 134–171</sub>
 
@@ -302,7 +270,7 @@ ANALYSIS_MODEL = "claude-opus-4-8"
 
 > ⚠️ **Fallstrick:** Dieser Name ist **fest im Code eingetragen**. Wenn `claude-opus-4-8` in Ihrem Workspace nicht freigeschaltet ist oder Langdock die ID ändert, schlägt **Phase 2 komplett fehl** — obwohl Phase 1 einwandfrei lief. Die gesammelten Rohdaten bleiben aber erhalten und exportierbar. Zum Ändern: Zeile 159 anpassen.
 
-### 2.8 Umgang mit „Modell akzeptiert keine Temperatur"
+### 2.7 Umgang mit „Modell akzeptiert keine Temperatur"
 
 <sub>📍 Code: Zeilen 173–186</sub>
 
@@ -316,7 +284,7 @@ Das Tool **lernt das zur Laufzeit**: Beim ersten solchen Fehler wird der Modelln
 
 **Was ist ein `set`?** Eine Menge ohne Reihenfolge und ohne Duplikate — ideal für Ja/Nein-Merklisten wie diese.
 
-### 2.9 Tote Modelle
+### 2.8 Tote Modelle
 
 <sub>📍 Code: Zeilen 188–231</sub>
 
@@ -331,7 +299,7 @@ Wenn ein Modell endgültig abgelehnt wurde, wird es für den Rest des Laufs übe
 
 **Der wichtige Teil steht im Kommentar (Zeilen 202–207):** Diese Sperre gilt **pro Modell**, nicht für den ganzen Lauf. Früher brach ein einziges veraltetes Modell den kompletten Lauf ab, sodass ein Zwei-Modell-Vergleich total ausfiel, obwohl das zweite Modell einwandfrei funktionierte. Jetzt läuft der Rest weiter.
 
-### 2.10 Die Notbremse („Circuit Breaker")
+### 2.9 Die Notbremse („Circuit Breaker")
 
 <sub>📍 Code: Zeilen 233–309</sub>
 
@@ -364,7 +332,7 @@ def _sleep_unless_aborted(seconds: float) -> bool:
 
 Diese Funktion ist ein **unterbrechbarer Schlaf**. Statt 120 Sekunden am Stück zu schlafen, schläft sie in 0,5-Sekunden-Häppchen und prüft dazwischen, ob inzwischen jemand die Notbremse gezogen hat. So sitzt kein Arbeitsstrang zwei Minuten lang eine Wartezeit ab, die längst sinnlos ist.
 
-### 2.11 Batch-Einstellungen für die Analyse
+### 2.10 Batch-Einstellungen für die Analyse
 
 <sub>📍 Code: Zeilen 311–330</sub>
 
@@ -393,7 +361,7 @@ Grund: Bei Antworten vom Typ „Die 15 besten Werkzeuge" stehen die Marken 8 bis
 
 > ⚠️ **Bleibt trotzdem ein Fallstrick:** Bei sehr langen Antworten geht die Mitte verloren. Wer das vermeiden will, kann `ANALYSIS_ANSWER_CHARS` erhöhen — zahlt das aber mit mehr Tokens und mehr Batches. Alternativ hilft der **Kurzantwort-Modus**, der von vornherein kompakte Antworten erzeugt.
 
-### 2.12 Die zwei Modellkataloge — das komplizierteste Thema im Script
+### 2.11 Die zwei Modellkataloge — das komplizierteste Thema im Script
 
 <sub>📍 Code: Zeilen 333–855</sub>
 
@@ -534,7 +502,7 @@ Beachtenswert in `list_completion_models` (Zeile 822): Der Kommentar erklärt, w
 > - Gibt es keine Modellliste (Netzproblem, Key falsch), fällt die App auf ein **freies Textfeld** zurück. Dort muss man den Namen exakt kennen.
 > - Der Zwischenspeicher ist an den API-Key gekoppelt. Ein anderer Key = eine andere Liste.
 
-### 2.13 `call_langdock()` — das Herzstück
+### 2.12 `call_langdock()` — das Herzstück
 
 <sub>📍 Code: Zeile 863</sub>
 
@@ -641,7 +609,7 @@ if status == 429:
         return None, _abort_error(lang), {}
     continue
 ```
-Die Unterscheidung, die in **Abschnitt 2.10** beschrieben wurde: dauerhaftes Limit → alles stoppen; vorübergehendes → warten und wiederholen. Die Wartezeiten müssen das rollierende Minutenfenster abdecken, deshalb starten sie bei 15 Sekunden.
+Die Unterscheidung, die in **Abschnitt 2.9** beschrieben wurde: dauerhaftes Limit → alles stoppen; vorübergehendes → warten und wiederholen. Die Wartezeiten müssen das rollierende Minutenfenster abdecken, deshalb starten sie bei 15 Sekunden.
 
 **Alle übrigen Statuscodes** *(Zeilen 1064–1084)*
 Werden auf verständliche zweisprachige Meldungen abgebildet — inklusive Hinweis auf die eingestellte Region beim 404 und auf den Modellnamen beim 400/422.
@@ -656,7 +624,7 @@ except Exception as e:
 ```
 Ein Auffangnetz. Selbst ein völlig unerwarteter Programmfehler bringt nicht die ganze App zum Absturz, sondern wird als Fehlermeldung für diesen einen Aufruf behandelt.
 
-### 2.14 `call_langdock_agent()` — der Websuche-Weg
+### 2.13 `call_langdock_agent()` — der Websuche-Weg
 
 <sub>📍 Code: Zeile 1134</sub>
 
@@ -790,7 +758,7 @@ Und die bereits beschriebene Sonderbehandlung: Bei „Modell nicht verfügbar" w
 
 > ⚠️ **Die wichtigste Einschränkung dieses Weges:** Die Agent-API meldet **keinen Tokenverbrauch**. In allen Tabellen und Exporten stehen bei aktiver Websuche `tokens_in = 0` und `tokens_out = 0`. Das ist kein Fehler — die Information existiert schlicht nicht. Für die Kostenkontrolle muss man das Langdock-Dashboard heranziehen. Ebenso wirkungslos ist dort der Regler „Max. Tokens" — die Oberfläche blendet ihn deshalb aus (Zeile 2826).
 
-### 2.15 Verbindungstest
+### 2.14 Verbindungstest
 
 <sub>📍 Code: Zeile 1427</sub>
 
@@ -816,7 +784,7 @@ Ein Minimal-Aufruf, der Zugangsdaten und Modellnamen prüft. Drei Details, die k
 
 > 💡 **Empfehlung:** Diesen Button immer vor einem größeren Lauf drücken. Er kostet einen einzigen Aufruf und erspart im Zweifel eine halbe Stunde Fehlersuche.
 
-### 2.16 Fragen generieren
+### 2.15 Fragen generieren
 
 <sub>📍 Code: Zeile 1478</sub>
 
@@ -864,7 +832,7 @@ Vorher war so ein Fall im Log unsichtbar, weil der Aufruf selbst als sauberer HT
 >
 > ⚠️ Der Parameter `web_search` muss hier zwingend mitgegeben werden. Er war früher fest auf `False` — mit der Folge, dass Agent-Modell-IDs an den Passthrough geschickt wurden, wo die anbieterpräfixierten Namen (`eu.anthropic.…`) mit Fehler 400 abgelehnt wurden.
 
-### 2.17 Eine Frage stellen
+### 2.16 Eine Frage stellen
 
 <sub>📍 Code: Zeile 1575</sub>
 
@@ -907,7 +875,7 @@ Trotzdem ist es eine wirksame Stellschraube: Markenempfehlungen und die Auswahl 
 
 > ⚠️ **Aber:** Es bleibt eine Bitte an das Modell. Es gibt keine Garantie, dass tatsächlich nur Quellen aus dem Zielmarkt herangezogen werden. Das ist eine schwächere Steuerung als eine echte Standorteinstellung — beim Interpretieren der Ergebnisse mitdenken.
 
-### 2.18 Textwerkzeuge
+### 2.17 Textwerkzeuge
 
 <sub>📍 Code: Zeilen 1651–1688</sub>
 
@@ -922,7 +890,7 @@ clean = re.sub(r"[ \t]{2,}", " ", clean)           # doppelte Leerzeichen
 ```
 Sonst blieben nach dem Entfernen unschöne Lücken vor Satzzeichen stehen.
 
-### 2.19 Die JSON-Reparatur
+### 2.18 Die JSON-Reparatur
 
 <sub>📍 Code: Zeilen 1690–1781</sub>
 
@@ -970,7 +938,7 @@ Erst wenn alle drei Stufen versagen, wird aufgegeben — mit einer Protokollzeil
 
 > ⚠️ Diese Robustheit ist notwendig, aber sie **verdeckt auch Probleme**: Wenn ein Modell dauerhaft schlechtes JSON liefert, merkt man das nur im Log, nicht in der Oberfläche.
 
-### 2.20 Die Markenanalyse — Phase 2 im Detail
+### 2.19 Die Markenanalyse — Phase 2 im Detail
 
 <sub>📍 Code: Zeilen 1782–2077</sub>
 
@@ -1104,7 +1072,7 @@ error = "; ".join(uniq)
 
 Scheitern zehn Batches am selben Rate Limit, sieht der Nutzer **eine** Meldung, nicht zehn identische. `dict.fromkeys` ist der übliche Python-Kniff, um Duplikate zu entfernen **und dabei die Reihenfolge zu behalten** (im Gegensatz zu einem `set`).
 
-### 2.21 Ergebnisse in eine Tabelle bringen
+### 2.20 Ergebnisse in eine Tabelle bringen
 
 <sub>📍 Code: Zeile 2080</sub>
 
@@ -1125,7 +1093,7 @@ Aus der verschachtelten Struktur („Antwort enthält Liste von Marken") wird ei
 
 Die Spalte `"mentions": 1` sieht überflüssig aus, ist aber praktisch: Summiert man sie nach Marke, erhält man die Abdeckung. Da innerhalb einer Antwort jede Marke nur einmal auftaucht, entspricht die Summe genau der Zahl der Antworten mit Nennung.
 
-### 2.22 Markenerkennung ohne KI
+### 2.21 Markenerkennung ohne KI
 
 <sub>📍 Code: Zeilen 2100–2145</sub>
 
@@ -1177,7 +1145,7 @@ Alles kleinschreiben, Markenzeichen-Symbole entfernen, Rechtsformen streichen, a
 > ```
 > Damit findet „Apple" auch „Applebee's", und „Visa" auch „Visage". Die Längenprüfung (mindestens 3 Zeichen) verhindert die schlimmsten Fälle, aber **bei kurzen oder generischen Markennamen sollte man die Ergebnisse stichprobenartig prüfen.**
 
-### 2.23 Export
+### 2.22 Export
 
 <sub>📍 Code: Zeilen 2147–2225</sub>
 
@@ -1210,7 +1178,7 @@ st.download_button(label, data, f"{safe}{ext}", mime, ...)
 
 Streamlit legt den Dateinamen eines Download-Buttons beim Zeichnen fest. Deshalb **muss** das Eingabefeld vor dem Button stehen. Die Zeile mit `re.sub` entfernt Pfadtrennzeichen — sonst könnte ein Name wie `../../geheim` die Datei außerhalb des Download-Ordners ablegen. Eine kleine, aber richtige Sicherheitsmaßnahme.
 
-### 2.24 Die Tutorials
+### 2.23 Die Tutorials
 
 <sub>📍 Code: Zeilen 2227–2300</sub>
 
@@ -1223,7 +1191,7 @@ _TUTORIALS = {
 
 Ein Nachschlagewerk mit einem Eintrag je Schritt, jeweils Titel und Text in beiden Sprachen. `render_tutorial(step)` (Zeile 2294) zeigt sie in einem **eingeklappten** Aufklappbereich — Hilfe für neue Nutzer, ohne Erfahrene zu stören.
 
-### 2.25 Oberfläche Schritt 1
+### 2.24 Oberfläche Schritt 1
 
 <sub>📍 Code: Zeile 2307</sub>
 
@@ -1251,7 +1219,7 @@ if question_mode == opt_gen and not topic.strip():
 
 Beim Klick auf Weiter wird die gesamte Konfiguration in den Session State geschrieben und — bei automatischem Modus — direkt die Fragengenerierung angestoßen.
 
-### 2.26 Oberfläche Schritt 2
+### 2.25 Oberfläche Schritt 2
 
 <sub>📍 Code: Zeile 2594</sub>
 
@@ -1264,7 +1232,7 @@ delta_str = tr(f" ({'+' if delta >= 0 else ''}{delta} gegenüber generiert)", �
 
 Man sieht also sofort „23 Fragen (+3 gegenüber generiert)".
 
-### 2.27 Oberfläche Schritt 3
+### 2.26 Oberfläche Schritt 3
 
 <sub>📍 Code: Zeile 2647</sub>
 
@@ -1304,7 +1272,7 @@ Eine Ampel, die vor Rate Limits warnt, bevor sie eintreten. Sie nimmt 30 Sekunde
 
 > ⚠️ Diese Schätzung ist bewusst pessimistisch (die meisten Antworten schöpfen `max_tokens` nicht aus) und der 60.000er-Bezugswert gilt nur für bestimmte Modelle. Als grober Kompass taugt sie, als exakte Vorhersage nicht. Bei aktiver Websuche wird sie gar nicht erst angezeigt, weil `max_tokens` dort keine Wirkung hat.
 
-### 2.28 Phase 1 — der Sammellauf
+### 2.27 Phase 1 — der Sammellauf
 
 <sub>📍 Code: Zeile 2984</sub>
 
@@ -1392,7 +1360,7 @@ needs_attention = bool(invalid_model_id()) or not raw_answers
 
 Zwei Fälle, in denen **nicht** weitergegangen wird: Ein Modell wurde abgelehnt (muss neu gewählt werden) oder es kam gar nichts zurück (die Analyse würde nur einen zweiten Fehler erzeugen). Sonst geht es zu Schritt 4.
 
-### 2.29 Phase 2 — die Analyse
+### 2.28 Phase 2 — die Analyse
 
 <sub>📍 Code: Zeile 3236</sub>
 
@@ -1406,7 +1374,7 @@ Die beiden Rücksetzungen sind wichtig: Die Analyse läuft mit einem **anderen**
 
 Danach werden die Ergebnisse in der **ursprünglichen Reihenfolge** wieder zusammengesetzt und mit den Marken angereichert. Im manuellen Modus filtert `_normalize_brands` auf die vorgegebene Liste — alle anderen gefundenen Marken landen in `unlisted_brands` und werden in Schritt 5 unter „Ebenfalls genannt" angezeigt, statt zu verschwinden.
 
-### 2.30 Oberfläche Schritt 4 — Rohdaten
+### 2.29 Oberfläche Schritt 4 — Rohdaten
 
 <sub>📍 Code: Zeile 3383</sub>
 
@@ -1432,7 +1400,7 @@ Die Wortwahl ist bewusst vorsichtig: „**nachweislich** genutzt". Fehlender Bel
 
 In der Tabelle darunter markiert **🔗** Marken, die nur über die verlinkten Quellen gefunden wurden. Im Aufklappbereich „Alle Antworten" stehen die Volltexte samt anklickbarer Quellenliste.
 
-### 2.31 Oberfläche Schritt 5 — Ergebnisse
+### 2.30 Oberfläche Schritt 5 — Ergebnisse
 
 <sub>📍 Code: Zeile 3601</sub>
 
@@ -1494,7 +1462,7 @@ if st.button(tr("Analyse neu starten", "Restart analysis"), type="primary", key=
 
 Führt **nur Phase 2** erneut aus, auf den bereits gespeicherten Antworten. Die teuren Sammel-Aufrufe entfallen. Praktisch, wenn eine Analyse an einem Rate Limit gescheitert ist oder man die Markenliste anpassen möchte.
 
-### 2.32 Der Router
+### 2.31 Der Router
 
 <sub>📍 Code: Zeilen 4269–4280</sub>
 
@@ -1579,29 +1547,6 @@ Die letzten Zeilen der Datei und zugleich der Kern des Streamlit-Modells: Bei je
 | **Summe** | | **≈ 125** |
 
 Dazu kommen wenige tokenlose Sondierungsaufrufe für die Modelllisten.
-
----
-
-## 4. Anhang: Die Nachbardatei `langdock_evidence.py`
-
-Eine kleine, in sich abgeschlossene Datei mit vier Bausteinen:
-
-| Baustein | Aufgabe |
-|---|---|
-| `key_fingerprint(api_key)` | Erzeugt `sha256:<12 Hex>/…<letzte 4 Zeichen>`. Beweist „selber Schlüssel", ohne ihn preiszugeben |
-| `redact(text, api_key)` | Sicherheitsnetz: ersetzt den Key, falls er je zurückgespiegelt wird. Alles andere bleibt Byte für Byte erhalten |
-| `EvidenceRecorder` | Schreibt je Anfrage eine JSON-Zeile. Mit `run_id` + `seq`, damit eine Anfrage der Katalogabfrage zugeordnet werden kann. Durch eine Sperre (`threading.Lock`) abgesichert, weil aus mehreren Arbeitssträngen geschrieben wird |
-| `response_headers(resp)` | Alle Antwort-Header, ungefiltert — die instanzidentifizierenden (`x-request-id`, `cf-ray`, `x-vercel-id`) belegen, dass zwei widersprüchliche Katalogantworten von verschiedenen Servern kamen |
-
-Ein Detail, das Sorgfalt zeigt:
-
-```python
-except OSError:
-    # Evidence recording must never take a run down with it.
-    pass
-```
-
-Kann die Beweisdatei nicht geschrieben werden (Festplatte voll, Rechte fehlen), wird das stillschweigend übergangen. Das Protokollieren darf niemals einen laufenden Lauf zum Absturz bringen.
 
 ---
 
