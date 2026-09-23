@@ -11,3 +11,6 @@ key.txt
 
 # Personal Claude Code permissions
 .claude/settings.local.json
+
+# Crash-safe backups of collection runs
+runs/

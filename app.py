@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -66,6 +67,8 @@ def init_state():
         "analysis_summary": "",  # phase 2 executive summary (from the single Opus call)
         "stop_requested": False,
         "phase1_complete": False,  # False + raw_answers present ⇒ a run was interrupted
+        "run_store_path": "",   # disk backup of the current collection (see run store)
+        "phase1_outcome": {},   # how the last collection ended: status/collected/expected
         "timing":         {},   # phase wall times + per-call elapsed data
         "lang":           "de", # UI + model response language: "de" or "en"
         "selected_models": [],  # effective model selection from Step 1 (catalog pick or manual IDs)
@@ -2095,6 +2098,134 @@ def save_csv(results: list[dict], model: str, brands: list[str] | None = None, f
 
 
 # ---------------------------------------------------------------------------
+# Run store — crash-safe backup of a collection run
+#
+# Phase 1 runs inside a single Streamlit script run, and Streamlit ends that run
+# WITHOUT an error message whenever the websocket to the browser drops (tab in the
+# background, standby, network change, redeploy). session_state survives a plain
+# rerun, but not a reconnect under a new session id — and then every answer that was
+# already paid for goes with it.
+#
+# So each answer is appended to a JSONL file the moment it arrives: line 1 holds the
+# run's metadata, the last line of a run that reached its end holds a verdict, and
+# everything in between is one answer per line. Append-only and flushed to disk, so a
+# teardown can at worst cost the single half-written line at the end.
+#
+# Caveat worth knowing: on Streamlit Community Cloud the container filesystem is
+# ephemeral. This survives a lost session and a script teardown — not a reboot or a
+# redeploy of the app.
+# ---------------------------------------------------------------------------
+RUN_STORE_DIR  = Path("runs")
+RUN_STORE_KEEP = 10  # backups kept on disk; older files are pruned when a run starts
+
+_run_store_lock = threading.Lock()
+
+
+def run_store_begin(meta: dict) -> Path | None:
+    """
+    Open a run's backup file and return its path, or None if the disk is not
+    writable — the backup is a safety net and must never block a run.
+    """
+    try:
+        RUN_STORE_DIR.mkdir(exist_ok=True)
+        # Second-resolution timestamp plus a random tail: two runs started within the
+        # same second must not end up writing into the same file.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path  = RUN_STORE_DIR / f"run_{stamp}_{random.randint(1000, 9999)}.jsonl"
+        with path.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({"_meta": meta}, ensure_ascii=False) + "\n")
+        # Pruned after the new file exists, so the cap counts this run too.
+        _run_store_prune()
+        log.info("Run store: backing this run up to %s", path)
+        return path
+    except OSError as e:
+        log.warning("Run store unavailable, continuing without a backup: %s", e)
+        return None
+
+
+def run_store_append(path: Path | None, entry: dict) -> None:
+    """Append one record and flush it — the point is to survive a process that never
+    gets to shut down cleanly."""
+    if path is None:
+        return
+    try:
+        with _run_store_lock, path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except (OSError, TypeError, ValueError) as e:
+        log.warning("Run store append failed: %s", e)
+
+
+def run_store_end(path: Path | None, status: str, collected: int, expected: int) -> None:
+    """Record how the run ended. A backup file WITHOUT this line is by definition a run
+    that was torn down mid-flight — which is what lets the UI say so instead of guessing."""
+    run_store_append(path, {"_end": {
+        "status":    status,          # complete | incomplete | stopped | aborted
+        "collected": collected,
+        "expected":  expected,
+        "ended_at":  datetime.now().isoformat(timespec="seconds"),
+    }})
+
+
+def run_store_discard(path) -> None:
+    """Delete a backup — its answers are safe elsewhere, or the user dropped them."""
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("Run store cleanup failed: %s", e)
+
+
+def _run_store_files() -> list[Path]:
+    try:
+        return sorted(RUN_STORE_DIR.glob("run_*.jsonl"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def _run_store_read(path: Path) -> dict:
+    meta, answers, end = {}, [], {}
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # half-written last line after a hard teardown
+                if not isinstance(obj, dict):
+                    continue
+                if "_meta" in obj:
+                    meta = obj["_meta"]
+                elif "_end" in obj:
+                    end = obj["_end"]
+                else:
+                    answers.append(obj)
+    except OSError as e:
+        log.warning("Run store unreadable (%s): %s", path, e)
+    return {"path": path, "meta": meta, "answers": answers, "end": end}
+
+
+def run_store_list() -> list[dict]:
+    """Backed-up runs that still hold answers, newest first."""
+    if not RUN_STORE_DIR.is_dir():
+        return []
+    runs = [_run_store_read(p) for p in _run_store_files()]
+    return [r for r in runs if r["answers"]]
+
+
+def _run_store_prune(keep: int = RUN_STORE_KEEP) -> None:
+    """Keep the directory bounded — old backups are history, not data."""
+    for old in _run_store_files()[keep:]:
+        run_store_discard(old)
+
+
+# ---------------------------------------------------------------------------
 # Per-step tutorial. Collapsed expander at the top of each page with a short
 # "what to do here" description, so the workflow is self-explanatory without
 # cluttering the page. Kept collapsed by default (a single click to open).
@@ -2476,6 +2607,106 @@ def _overview_card(title: str, edit_step: int, edit_key: str, rows: list[tuple[s
             col_value.markdown(value)
 
 
+# ---------------------------------------------------------------------------
+# A run that never reached Step 4 — say what happened and offer its answers.
+#
+# The teardown itself is silent: Streamlit stops the script run without an error and
+# the page simply re-renders here, which is why an interrupted collection used to
+# look like the app had quietly given up. Two sources, in this order: session_state
+# (the run died but the browser kept its session) and the run store on disk (the
+# session itself was lost).
+# ---------------------------------------------------------------------------
+_INTERRUPT_CAUSE = (
+    "Streamlit beendet einen laufenden Durchlauf ohne Fehlermeldung, sobald die Verbindung "
+    "zwischen Browser und App abreißt — Tab im Hintergrund, Standby, Netzwechsel, Neustart "
+    "oder Redeploy der App. Die bereits bezahlten Antworten sind gesichert.",
+    "Streamlit ends a running script without an error message as soon as the connection "
+    "between browser and app drops — tab in the background, standby, network change, restart "
+    "or redeploy of the app. The answers already paid for are safe.",
+)
+
+
+def render_recovery_block():
+    if st.session_state.get("phase1_complete", False):
+        return
+
+    partial   = st.session_state.get("raw_answers", []) or []
+    outcome   = st.session_state.get("phase1_outcome", {}) or {}
+    from_disk = None
+    if not partial:
+        stored = run_store_list()
+        if not stored:
+            return
+        from_disk = stored[0]
+        partial   = from_disk["answers"]
+        outcome   = from_disk["end"] or {}
+
+    meta     = (from_disk or {}).get("meta", {})
+    expected = outcome.get("expected") or meta.get("expected_total") or 0
+    status   = outcome.get("status") or "interrupted"
+    of_total = tr(f" von {expected}", f" of {expected}") if expected else ""
+
+    if status == "stopped":
+        st.warning(tr(
+            f"⏹ Lauf gestoppt — {len(partial)}{of_total} Antworten gesichert.",
+            f"⏹ Run stopped — {len(partial)}{of_total} answers saved.",
+        ))
+        cause = tr("Du hast den Lauf selbst beendet.", "You stopped the run yourself.")
+    elif status == "aborted":
+        st.error(tr(
+            f"⛔ Lauf abgebrochen — {len(partial)}{of_total} Antworten gesichert.",
+            f"⛔ Run aborted — {len(partial)}{of_total} answers saved.",
+        ))
+        cause = outcome.get("reason") or tr("API-Limit erreicht.", "API limit reached.")
+    elif status in ("complete", "incomplete"):
+        st.info(tr(
+            f"📥 {len(partial)}{of_total} Antworten gesammelt, aber noch nicht analysiert.",
+            f"📥 {len(partial)}{of_total} answers collected, but not analyzed yet.",
+        ))
+        cause = tr("Der Lauf ist zu Ende gelaufen — es fehlt nur die Analyse.",
+                   "The run finished — only the analysis is missing.")
+    else:
+        st.warning(tr(
+            f"⚠️ Lauf unterbrochen — {len(partial)}{of_total} Antworten gesichert.",
+            f"⚠️ Run interrupted — {len(partial)}{of_total} answers saved.",
+        ))
+        cause = tr(*_INTERRUPT_CAUSE)
+
+    details = [cause]
+    if meta.get("started_at"):
+        details.append(tr(f"Lauf gestartet: {meta['started_at']}",
+                          f"Run started: {meta['started_at']}"))
+    if from_disk:
+        details.append(tr("Aus der Sicherung auf dem Server wiederhergestellt.",
+                          "Restored from the server-side backup."))
+    st.caption(" · ".join(details))
+
+    col_use, col_drop = st.columns(2)
+    if col_use.button(
+        tr(f"→ Mit diesen {len(partial)} Antworten weiter zur Analyse",
+           f"→ Continue to analysis with these {len(partial)} answers"),
+        type="primary",
+    ):
+        if from_disk:
+            st.session_state.raw_answers    = partial
+            st.session_state.phase1_errors  = []
+            st.session_state.phase1_outcome = outcome
+            # Keep pointing at the backup: it is deleted once the analysis is done, so
+            # a second teardown in between still has something to fall back on.
+            st.session_state.run_store_path = str(from_disk["path"])
+        st.session_state.setdefault("timing", {}).setdefault("p1_calls", [])
+        _go_to(4)
+    if col_drop.button(tr("Verwerfen und neu sammeln", "Discard and collect again")):
+        run_store_discard(str(from_disk["path"]) if from_disk
+                          else st.session_state.get("run_store_path"))
+        st.session_state.raw_answers    = []
+        st.session_state.phase1_errors  = []
+        st.session_state.phase1_outcome = {}
+        st.session_state.run_store_path = ""
+        st.rerun()
+    st.divider()
+
+
 def render_step3():
     render_step_header(3)
 
@@ -2501,28 +2732,9 @@ def render_step3():
             _go_to(2)
         return
 
-    # Answers from a collection run that was stopped or interrupted. Streamlit tears
-    # the collection down as soon as any button is clicked, so we land back here —
-    # without this the already-paid-for answers would be unreachable.
-    partial = st.session_state.get("raw_answers", [])
-    if partial and not st.session_state.get("phase1_complete", False):
-        st.info(tr(
-            f"📥 {len(partial)} Antworten aus einem abgebrochenen Lauf sind gespeichert.",
-            f"📥 {len(partial)} answers from an interrupted run are saved.",
-        ))
-        col_use, col_drop = st.columns(2)
-        if col_use.button(
-            tr(f"→ Mit diesen {len(partial)} Antworten weiter zur Analyse",
-               f"→ Continue to analysis with these {len(partial)} answers"),
-            type="primary",
-        ):
-            st.session_state.setdefault("timing", {}).setdefault("p1_calls", [])
-            _go_to(4)
-        if col_drop.button(tr("Verwerfen und neu sammeln", "Discard and collect again")):
-            st.session_state.raw_answers   = []
-            st.session_state.phase1_errors = []
-            st.rerun()
-        st.divider()
+    # Answers from a collection run that was stopped or interrupted — from this
+    # session, or from the disk backup if the session itself was lost.
+    render_recovery_block()
 
     # --- 1. Settings from Steps 1 and 2 ----------------------------------------
     st.subheader(tr("1. Einstellungen prüfen", "1. Check your settings"))
@@ -2778,13 +2990,26 @@ def _run_phase1():
     raw_answers: list[dict] = []
     st.session_state.raw_answers    = raw_answers
     st.session_state.phase1_complete = False
+    st.session_state.phase1_outcome  = {}
     errors       = []
     # (question_index, question, run_num, model) to retry once
     failed_tasks: list[tuple[int, str, int, str]] = []
     p1_timings: list[dict] = []
 
+    # Disk backup for this run. session_state survives a rerun but not a reconnect
+    # under a new session id, and that is exactly when a long run tends to die.
+    store_path = run_store_begin({
+        "started_at":     datetime.now().isoformat(timespec="seconds"),
+        "expected_total": total,
+        "questions":      len(questions),
+        "runs":           runs,
+        "models":         models,
+        "lang":           lang,
+    })
+    st.session_state.run_store_path = str(store_path) if store_path else ""
+
     def _record_answer(question: str, run_num: int, answer: str, usage: dict, model: str):
-        raw_answers.append({
+        entry = {
             "question":        question,
             "run":             run_num + 1,
             "answer":          answer,
@@ -2793,7 +3018,9 @@ def _run_phase1():
             "web_search_used": usage.get("web_search_used", False),
             "sources":         usage.get("sources", []),
             "citation_count":  usage.get("citation_count", 0),
-        })
+        }
+        raw_answers.append(entry)
+        run_store_append(store_path, entry)
 
     # ------------------------------------------------------------------
     # Phase 1 — Collect answers (parallel)
@@ -2831,31 +3058,52 @@ def _run_phase1():
         )
         return answer, err, usage, time.time() - t_start
 
+    # Futures whose result has already been handled, so the salvage pass below can
+    # tell them apart from the calls that were still in flight when we broke out.
+    processed: set = set()
+    stopped_early = False
+    completed     = 0
+
     with ThreadPoolExecutor(max_workers=parallel) as executor:
         future_map = {
             executor.submit(_timed_ask, q, mdl): (i, run_num, q, mdl)
             for i, q, run_num, mdl in all_tasks
         }
 
-        completed = 0
+        def _drop_queue() -> int:
+            """
+            Cancel everything still waiting in the queue. Without this, leaving the
+            `with` block calls shutdown(wait=True), which runs every queued call anyway
+            and then throws its answer away — minutes of apparent hang, and a bill for
+            answers nobody ever sees. Calls already in flight cannot be cancelled; the
+            salvage pass keeps those instead.
+            """
+            executor.shutdown(wait=False, cancel_futures=True)
+            return sum(1 for f in future_map if f.cancelled())
+
         for future in as_completed(future_map):
             i, run_num, question, task_model = future_map[future]
-            completed += 1
+            # Counted only once this future's result is actually consumed: the one that
+            # trips a break below is left to the salvage pass, which counts it there.
 
             if st.session_state.get("stop_requested", False):
+                n_dropped     = _drop_queue()
+                stopped_early = True
                 status_line.warning(tr(
-                    f"⏹ Gestoppt nach {len(raw_answers)} von {total} Antworten. "
-                    "Analyse wird mit bisherigen Antworten fortgesetzt.",
-                    f"⏹ Stopped after {len(raw_answers)} of {total} answers. "
-                    "Analysis continues with the answers collected so far.",
+                    f"⏹ Gestoppt nach {len(raw_answers)} von {total} Antworten — "
+                    f"{n_dropped} noch nicht gestartete Calls verworfen. Bereits laufende "
+                    "Calls werden zu Ende gebracht und mitgezählt.",
+                    f"⏹ Stopped after {len(raw_answers)} of {total} answers — "
+                    f"{n_dropped} calls dropped before they started. Calls already in "
+                    "flight are finished and still counted.",
                 ))
                 break
 
             if run_abort_reason():
                 # e.g. the workspace spending limit: no later call can succeed, so
                 # drop the queue instead of walking through it call by call.
-                for pending in future_map:
-                    pending.cancel()
+                _drop_queue()
+                stopped_early = True
                 error_box.error(tr(
                     f"⛔ Lauf abgebrochen: {run_abort_reason()} — "
                     f"{len(raw_answers)} von {total} Antworten wurden gesammelt und bleiben erhalten.",
@@ -2865,7 +3113,18 @@ def _run_phase1():
                 errors.append(run_abort_reason())
                 break
 
-            answer, err, usage, call_elapsed = future.result()
+            processed.add(future)
+            completed += 1
+            try:
+                answer, err, usage, call_elapsed = future.result()
+            except Exception as exc:  # noqa: BLE001 — one crashed worker must not end the run
+                failed_tasks.append((i, question, run_num, task_model))
+                log.exception("Worker raised — Frage %d, Run %d, model=%s", i+1, run_num+1, task_model)
+                error_box.warning(tr(
+                    f"⚠️ Frage {i+1}, Run {run_num+1} ({task_model}) abgestürzt: {exc} — wird am Ende erneut versucht.",
+                    f"⚠️ Question {i+1}, Run {run_num+1} ({task_model}) crashed: {exc} — will retry at the end.",
+                ))
+                continue
             call_times.append(call_elapsed)
             p1_timings.append({
                 "question":  question,
@@ -2902,6 +3161,36 @@ def _run_phase1():
             ))
 
     # ------------------------------------------------------------------
+    # Salvage pass — the calls that were still running when the queue was dropped
+    # finished while the executor shut down. They are paid for either way, so their
+    # answers are recorded instead of discarded.
+    # ------------------------------------------------------------------
+    if stopped_early:
+        salvaged = 0
+        for future, (i, run_num, question, task_model) in future_map.items():
+            if future in processed or future.cancelled() or not future.done():
+                continue
+            try:
+                answer, err, usage, call_elapsed = future.result()
+            except Exception:  # noqa: BLE001 — nothing to salvage from a crashed worker
+                continue
+            if not answer:
+                continue
+            call_times.append(call_elapsed)
+            p1_timings.append({
+                "question":  question,
+                "run":       run_num + 1,
+                "model":     task_model,
+                "elapsed_s": round(call_elapsed, 3),
+                "ok":        True,
+            })
+            _record_answer(question, run_num, answer, usage, task_model)
+            salvaged += 1
+        if salvaged:
+            completed += salvaged
+            log.info("Phase1 salvage — %d in-flight answers kept after the queue was dropped", salvaged)
+
+    # ------------------------------------------------------------------
     # Retry pass — one more attempt for calls that failed above. Only runs if the
     # user didn't stop. Anything still failing after this is recorded as an error.
     # ------------------------------------------------------------------
@@ -2918,13 +3207,22 @@ def _run_phase1():
             for future in as_completed(retry_map):
                 i, run_num, question, task_model = retry_map[future]
                 if st.session_state.get("stop_requested", False):
+                    retry_executor.shutdown(wait=False, cancel_futures=True)
                     break
                 if run_abort_reason():
-                    for pending in retry_map:
-                        pending.cancel()
+                    retry_executor.shutdown(wait=False, cancel_futures=True)
                     errors.append(run_abort_reason())
                     break
-                answer, err, usage, call_elapsed = future.result()
+                try:
+                    answer, err, usage, call_elapsed = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(tr(
+                        f"Frage {i+1}, Run {run_num+1} ({task_model}): {exc}",
+                        f"Question {i+1}, Run {run_num+1} ({task_model}): {exc}",
+                    ))
+                    log.exception("Retry worker raised — Frage %d, Run %d, model=%s",
+                                  i+1, run_num+1, task_model)
+                    continue
                 call_times.append(call_elapsed)
                 p1_timings.append({
                     "question":  question,
@@ -2958,8 +3256,26 @@ def _run_phase1():
     # cases stay here instead of moving on.
     needs_attention = bool(invalid_model_id()) or not raw_answers
 
+    # How this run ended, for the banner in Step 4 and for a backup file that may have
+    # to explain itself in a later session. Read before stop_requested is cleared.
+    if run_abort_reason():
+        status = "aborted"
+    elif st.session_state.get("stop_requested", False):
+        status = "stopped"
+    elif len(raw_answers) < total:
+        status = "incomplete"
+    else:
+        status = "complete"
+    run_store_end(store_path, status, len(raw_answers), total)
+
     st.session_state.raw_answers     = raw_answers
     st.session_state.phase1_errors   = errors
+    st.session_state.phase1_outcome  = {
+        "status":    status,
+        "collected": len(raw_answers),
+        "expected":  total,
+        "reason":    run_abort_reason() or "",
+    }
     st.session_state.stop_requested  = False
     st.session_state.phase1_complete = not needs_attention
     st.session_state.timing = {
@@ -3133,6 +3449,10 @@ def _run_brand_analysis(raw_answers: list[dict], prior_errors: list | None = Non
             for e in errors:
                 st.markdown(f"- {e}")
 
+    # The backup has done its job: the dataset is analyzed and exportable from Step 5.
+    run_store_discard(st.session_state.get("run_store_path"))
+    st.session_state.run_store_path = ""
+
     st.session_state.results          = results
     st.session_state.analysis_summary = summary
     st.session_state.step             = 5
@@ -3177,6 +3497,33 @@ def render_step4():
         + (f", {len(errors)} failed" if errors else "")
         + ". No brand/sentiment analysis has run yet — that will use additional API calls.",
     ))
+
+    # A run that did not deliver every planned answer must say so here — otherwise the
+    # only visible sign is a raw-data table that is quietly shorter than expected.
+    outcome   = st.session_state.get("phase1_outcome", {}) or {}
+    collected = outcome.get("collected", len(raw_answers))
+    expected  = outcome.get("expected", 0)
+    if outcome.get("status") == "stopped":
+        st.warning(tr(
+            f"⏹ Der Lauf wurde gestoppt: {collected} von {expected} geplanten Antworten. "
+            "Kennzahlen beziehen sich nur auf diese Teilmenge.",
+            f"⏹ The run was stopped: {collected} of {expected} planned answers. "
+            "All metrics refer to this subset only.",
+        ))
+    elif outcome.get("status") == "aborted":
+        st.error(tr(
+            f"⛔ Der Lauf wurde abgebrochen: {collected} von {expected} geplanten Antworten — "
+            f"{outcome.get('reason') or tr('API-Limit erreicht', 'API limit reached')}.",
+            f"⛔ The run was aborted: {collected} of {expected} planned answers — "
+            f"{outcome.get('reason') or 'API limit reached'}.",
+        ))
+    elif outcome.get("status") == "incomplete":
+        st.warning(tr(
+            f"⚠️ Unvollständig: {collected} von {expected} geplanten Antworten. "
+            "Die übrigen Calls sind auch im zweiten Versuch fehlgeschlagen — siehe Fehlerliste.",
+            f"⚠️ Incomplete: {collected} of {expected} planned answers. "
+            "The remaining calls failed on the retry as well — see the error list.",
+        ))
 
     # --- Web-search verification -----------------------------------------
     # When web search was enabled, show how many answers actually invoked the

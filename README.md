@@ -231,11 +231,16 @@ Dieser Abschnitt ist bewusst ausführlich. Vieles davon ist **kein Programmierfe
 
 ### Datenverlust
 
+Phase 1 läuft in **einem einzigen Streamlit-Script-Durchlauf**. Streamlit beendet so einen Durchlauf **ohne Fehlermeldung**, sobald die Verbindung zwischen Browser und App abreißt — Tab im Hintergrund, Standby, Netzwechsel, Neustart oder Redeploy. Die Seite rendert dann einfach wieder Schritt 3. Genau dieses Verhalten ist der Grund für die Sicherung unten.
+
+**Sicherung auf dem Server:** Jede Antwort wird sofort nach Eingang an eine JSONL-Datei unter `runs/` angehängt (eine Datei pro Lauf, die letzten 10 werden aufbewahrt). Schritt 3 erkennt einen unvollendeten Lauf, sagt, was passiert ist, und bietet die Antworten zur Weiterverwendung an — auch dann, wenn die Sitzung selbst verloren ging. Die Datei wird gelöscht, sobald die Analyse durchgelaufen ist, oder wenn Sie die Antworten verwerfen.
+
 | Problem | Erklärung | Was tun |
 |---|---|---|
-| **Browser-Tab schließen = alles weg** | Alle Daten liegen im Session State, also nur im Arbeitsspeicher. Es gibt keine automatische Speicherung. | Nach Phase 1 (Schritt 4) **immer** exportieren. Der Export dort ist vollwertig und braucht keine Analyse. |
+| **Browser-Tab schließen** | Der Session State ist weg, die Sicherung unter `runs/` nicht. | Neu verbinden — Schritt 3 bietet den Lauf an. Trotzdem gilt: in Schritt 4 **immer** exportieren. |
 | **Ein Klick reißt einen laufenden Sammelvorgang ab** | Streamlit startet das Script bei jeder Interaktion neu. Genau so funktioniert der Stop-Button — jeder andere Klick tut aber dasselbe. | Während Phase 1 nichts anklicken. Falls doch: Schritt 3 bietet die gesammelten Antworten zur Weiterverwendung an. |
-| **Streamlit-Server neu gestartet** | Alle Sitzungen verlieren ihren Zustand. | Exportieren. |
+| **Streamlit-Server neu gestartet** | Alle Sitzungen verlieren ihren Zustand. Lokal überlebt `runs/` den Neustart — **auf Streamlit Community Cloud nicht**, dort ist das Dateisystem flüchtig und wird bei Reboot oder Redeploy zurückgesetzt. | Lokal: Schritt 3 bietet den Lauf an. In der Cloud: exportieren, und lange Läufe stückeln. |
+| **Lange Läufe in der Cloud** | Je länger ein Lauf, desto wahrscheinlicher der stille Abbruch. 30+ Minuten in einem Script-Durchlauf sind nicht zugesichert. | Parallele Calls hochsetzen (verkürzt die Laufzeit) und große Läufe in mehrere kleine teilen. |
 
 ### Kosten laufen aus dem Ruder
 
